@@ -116,8 +116,16 @@ describe('schedule-runner pre-check integration (source-level)', () => {
     expect(retryLoop).toMatch(/attemptFireTask\(taskDef,/)
   })
 
-  it('passes preCheckPrefix to attemptFireTask in the cron loop', () => {
-    expect(SRC).toMatch(/attemptFireTask\(task, agentName, now, cronPc\.prefix, lateCatchUpMs\)/)
+  it('passes preCheckPrefix and the original occurrence to attemptFireTask in the cron loop', () => {
+    expect(SRC).toMatch(/attemptFireTask\(task, agentName, now, cronPc\.prefix, lateCatchUpMs, occurrenceMs\)/)
+  })
+
+  it('retry uses persisted occurrence and never first_attempt as delivery identity', () => {
+    const retryLoopIdx = SRC.indexOf('for (const row of pendingRows)')
+    const retryLoop = SRC.slice(retryLoopIdx, SRC.indexOf('for (const task of tasks)'))
+    expect(retryLoop).toMatch(/attemptFireTask\(taskDef, row\.agent_name, now, retryPc\.prefix, undefined, row\.scheduled_occurrence \?\? now\)/)
+    expect(retryLoop).not.toMatch(/attemptFireTask\([^\n]*row\.first_attempt/)
+    expect(retryLoop).toMatch(/Legacy retry lacks occurrence; manual review required; no replay/)
   })
 
   it('skips and records the run when pre-check returns skip in cron loop', () => {

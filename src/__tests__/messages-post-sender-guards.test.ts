@@ -111,6 +111,13 @@ describe('POST /api/messages sender guards (runtime)', () => {
     expect(r.json).not.toHaveProperty('homoglyph_warning')
   })
 
+  it('rejects a displayed person name as a recipient agentId', async () => {
+    const r = await post({ from: MAIN_AGENT_ID, to: 'MAG Attila', content: 'wrong handoff' })
+    expect(r.statusCode).toBe(400)
+    expect(String(r.json.error)).toContain('Unknown local agentId')
+    expect(String(r.json.error)).toContain(MAIN_AGENT_ID)
+  })
+
   it('rejects an empty from/to/content with 400, before any guard', async () => {
     const r = await post({ from: '', to: MAIN_AGENT_ID, content: 'x' })
     expect(r.statusCode).toBe(400)

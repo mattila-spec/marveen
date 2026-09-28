@@ -6,7 +6,11 @@ import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { JsonRpcProcess, channelInput, toolResult, retireExhaustedThread } from './lib/codex-rpc.mjs'
+import { normalizeCodexChannelState, migrateLegacyPending } from './lib/codex-channel-state.mjs'
 import { DEFAULT_MODEL, escalationTool, economyInstructions, EconomySession } from './lib/codex-economy.mjs'
+import { CodexDeliveryStore, getCodexDeliveryStore } from '../dist/codex-delivery.js'
+import { DeliveryRecoveryStore, getDeliveryRecoveryStore } from '../dist/codex-recovery.js'
+import { randomUUID } from 'node:crypto'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const bridgeTest = process.argv.includes('--bridge-test')
@@ -25,10 +29,13 @@ let telegram
 let socketServer
 let tools = []
 let state = { threads: {}, pending: [] }
+let recoveryStore
+let deliveryStore
+let ownerChatId
 
-function persist() {
+function persist(snapshot = state) {
   mkdirSync(store, { recursive: true, mode: 0o700 })
-  writeFileSync(stateFile + '.tmp', JSON.stringify(state), { mode: 0o600 })
+  writeFileSync(stateFile + '.tmp', JSON.stringify(snapshot), { mode: 0o600 })
   renameSync(stateFile + '.tmp', stateFile)
 }
 function status() {
@@ -74,8 +81,8 @@ function mcpConfig(internal = false) {
   return servers
 }
 function instructions(internal = false) {
-  if (bridgeTest && process.argv.includes('--escalation-test')) return economyInstructions + '\nTest: on Luna request a stronger model for this complex debugging test. On Sol call telegram_reply with chat_id test-chat and text CODEX_BRIDGE_OK. Do not use other tools.'
-  if (bridgeTest) return 'Call telegram_reply with chat_id test-chat and text CODEX_BRIDGE_OK. Do not use other tools.'
+  if (bridgeTest && process.argv.includes('--escalation-test')) return economyInstructions + '\nTest: on Luna request a stronger model for this complex debugging test. On Sol call telegram_reply with chat_id synthetic-chat-fixture and text CODEX_BRIDGE_OK. Do not use other tools.'
+  if (bridgeTest) return 'Call telegram_reply with chat_id synthetic-chat-fixture and text CODEX_BRIDGE_OK. Do not use other tools.'
   const files = ['CLAUDE.md', 'SOUL.md'].filter(f => existsSync(join(root, f)))
   return files.map(f => readFileSync(join(root, f), 'utf8')).join('\n\n') + `
 Runtime: You are Marveen running through Codex with the owner's ChatGPT account.
@@ -101,9 +108,7 @@ requires it or there is an actionable result. Never report unverified success.
 function enqueue(params) {
   channelInput(params)
   const key = `${params.meta.chat_id}:${params.meta.message_id ?? ''}`
-  if (params.meta.message_id && state.pending.some(p => p.key === key)) return
-  state.pending.push({key, params})
-  persist()
+  recoveryStore.prepareChannel({key, params}, true)
   void drain()
 }
 
@@ -168,7 +173,21 @@ async function drainLane(lane) {
   status()
   try {
     while (!stopping) {
-      const item = state.pending.find(p => !!p.internal === lane.internal)
+      const channelDelivery = recoveryStore.claimChannel(lane.internal)
+      const legacyItem = channelDelivery ? JSON.parse(channelDelivery.payload) : null
+      const delivery = !legacyItem && lane.internal && ownerChatId
+        ? (() => {
+            for (const queued of deliveryStore?.listQueued() ?? []) {
+              const claimed = deliveryStore.claimQueued(queued.deliveryId)
+              if (claimed) return claimed
+            }
+            return null
+          })()
+        : null
+      const item = legacyItem ?? (delivery ? {
+        key: delivery.deliveryId, internal: true,
+        params: {meta: {chat_id: ownerChatId, source: 'dashboard'}, content: delivery.prompt},
+      } : null)
       if (!item) break
       const chatId = String(item.params.meta.chat_id)
       try {
@@ -188,10 +207,18 @@ async function drainLane(lane) {
           const sent = await telegram.request('tools/call', { name: 'reply', arguments: { chat_id: chatId, text: result.text } })
           if (sent.isError) throw new Error('Telegram delivery failed')
         }
+        if (delivery) deliveryStore.finish(delivery.deliveryId, 'completed')
+        if (channelDelivery) recoveryStore.finishChannel(channelDelivery.deliveryId, 'completed')
       } catch (error) {
         // Keep failed work for inspection but do not blindly rerun side effects.
-        console.error('Codex turn failed; recorded in channels.json')
-        state.lastFailure = { ...item, error: error.message, at: new Date().toISOString() }
+        console.error(delivery ? 'Scheduled Codex turn failed; delivery marked failed' : 'Codex turn failed; recorded in channels.json')
+        if (delivery) {
+          deliveryStore.finish(delivery.deliveryId, 'failed', 'codex_turn_failed', error.message)
+        } else {
+          if (channelDelivery) recoveryStore.finishChannel(channelDelivery.deliveryId, stopping ? 'interrupted' : 'failed')
+          state.lastFailure = { ...item, error: error.message, at: new Date().toISOString() }
+          persist()
+        }
         if (bridgeTest) { console.error(error.message); shutdown(1); return }
         if (!item.internal && !stopping) {
           await telegram.request('tools/call', {name: 'reply', arguments: {
@@ -199,8 +226,7 @@ async function drainLane(lane) {
           }}).catch(() => {})
         }
       }
-      state.pending.splice(state.pending.indexOf(item), 1)
-      persist()
+      // Completion is durable before the next item is claimed. No JSON replay queue.
       console.log('Codex: ready')
       if (bridgeTest) { console.log('CODEX_BRIDGE_OK'); shutdown(); return }
     }
@@ -208,7 +234,9 @@ async function drainLane(lane) {
 }
 
 try {
-  if (preflight) {
+  if (process.argv.includes('--offline-import-smoke')) {
+    console.log('OFFLINE_IMPORT_OK')
+  } else if (preflight) {
     const rpc = await openCodex()
     await closeCodex(rpc)
     console.log('ChatGPT authentication OK; channel not started')
@@ -220,7 +248,19 @@ try {
     shutdown()
   } else {
     if (!plugin || !existsSync(plugin)) throw new Error('MARVEEN_CODEX_TELEGRAM_PLUGIN must point to the installed Telegram server.ts')
-    if (existsSync(stateFile)) state = JSON.parse(readFileSync(stateFile, 'utf8'))
+    if (existsSync(stateFile)) state = normalizeCodexChannelState(JSON.parse(readFileSync(stateFile, 'utf8')))
+    // Older channels.json queue entries keep their original shape and drain
+    // through the legacy path. Scheduled deliveries live in SQLite instead.
+    mkdirSync(store, {recursive: true, mode: 0o700})
+    deliveryStore = bridgeTest
+      ? new CodexDeliveryStore(join(store, 'delivery-test.sqlite3'))
+      : getCodexDeliveryStore()
+    deliveryStore.interruptRunning()
+    recoveryStore = bridgeTest ? new DeliveryRecoveryStore(join(store, 'delivery-test.sqlite3')) : getDeliveryRecoveryStore()
+    const interrupted = recoveryStore.recoverChannels()
+    const legacyCount = state.pending.length
+    migrateLegacyPending(state, recoveryStore, persist)
+    if (interrupted || legacyCount) console.log(JSON.stringify({event: 'channel-recovery', interrupted, legacyMigrated: legacyCount, policy: 'uncertain records require manual_review; no automatic replay'}))
     if (state.lastFailure && !state.lastFailure.recovered) {
       const failedChat = state.lastFailure.params?.meta?.chat_id
       if (failedChat && retireExhaustedThread(state, String(failedChat), state.lastFailure.error)) {
@@ -244,6 +284,7 @@ try {
     mkdirSync(store, {recursive: true, mode: 0o700})
     if (existsSync(socketPath)) unlinkSync(socketPath)
     const { resolveOwnerChatId } = await import('../dist/owner-chat.js')
+    ownerChatId = resolveOwnerChatId()
     socketServer = createServer(socket => {
       let data = ''
       socket.setTimeout(5000, () => socket.destroy())
@@ -256,8 +297,7 @@ try {
           const {text} = JSON.parse(data.split('\n')[0])
           const owner = resolveOwnerChatId()
           if (!owner || typeof text !== 'string' || !text.trim()) throw new Error('Invalid prompt or owner chat missing')
-          state.pending.push({key: `internal:${Date.now()}`, internal: true, params: {meta: {chat_id: owner, source: 'dashboard'}, content: text}})
-          persist()
+          recoveryStore.prepareChannel({key: `internal:${randomUUID()}`, internal: true, params: {meta: {chat_id: owner, source: 'dashboard'}, content: text}}, true)
           socket.end(JSON.stringify({ok: true}) + '\n')
           void drain()
         } catch (error) { socket.end(JSON.stringify({ok: false, error: error.message}) + '\n') }
@@ -267,6 +307,8 @@ try {
     ready = true
     status()
     console.log('Codex: ready')
+    const deliveryPoll = setInterval(() => { void drain() }, 1000)
+    deliveryPoll.unref()
     await drain()
   }
 } catch (error) {

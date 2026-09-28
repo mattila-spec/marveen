@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { mkdirSync, rmSync } from 'node:fs'
-import { agentDir } from '../web/agent-config.js'
 import { EventEmitter } from 'node:events'
+import { mkdirSync, rmSync } from 'node:fs'
 import { initDatabase } from '../db.js'
 import { MAIN_AGENT_ID } from '../config.js'
 import { tryHandleMessages } from '../web/routes/messages.js'
+import { agentDir } from '../web/agent-config.js'
 import type { RouteContext } from '../web/routes/types.js'
 
 // MSGWARN908: POST /api/messages warned "'<to>' nem fut -- ... elveszik" for
@@ -72,5 +72,11 @@ describe('POST /api/messages to the main agent (MSGWARN908)', () => {
     expect(r.statusCode).toBe(200)
     expect(r.json.targetRunning).toBe(false)
     expect(String(r.json.warning)).toContain('nem fut')
+  })
+
+  it('rejects an unregistered display label before warning or persistence', async () => {
+    const r = await post({ from: MAIN_AGENT_ID, to: 'Synthetic Display Label', content: 'ping' })
+    expect(r.statusCode).toBe(400)
+    expect(String(r.json.error)).toContain('Unknown local agentId')
   })
 })

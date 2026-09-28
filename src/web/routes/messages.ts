@@ -332,6 +332,12 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       // coordinator inserts directly into the DB, bypassing this endpoint.
       json(res, { error: 'Invalid recipient: use "<system>/<agent>" (slash) for a federated address, not the "federation:x:y" source form' }, 400)
       return true
+    } else if (!/^[a-zA-Z0-9_-]+$/.test(storedTo) || !isKnownAgent(storedTo)) {
+      // Display names (including OWNER_NAME) are not agent ids. Accepting one
+      // creates a message for a fictional agent-<display name> session, then
+      // leaves the handoff pending until the abandon window expires.
+      json(res, { error: `Unknown local agentId '${storedTo}'. Use '${MAIN_AGENT_ID}' for the main agent; notify the owner through the configured channel.` }, 400)
+      return true
     }
     // Unknown LOCAL recipient (UNKNOWNTO924): reject at once.
     // Measured: a literal 'PLACEHOLDER' recipient (x3) and an '<agent>_placeholder' one

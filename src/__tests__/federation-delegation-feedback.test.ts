@@ -79,9 +79,15 @@ describe('POST /api/messages colon-form to guard (L5)', () => {
     expect(r.json.error).toMatch(/slash/i)
   })
 
-  it('still accepts a normal local recipient and a valid qualified one', async () => {
+  it('still accepts a registered local recipient and a valid qualified one', async () => {
     expect((await postMessage({ from: 'localboss', to: 'localmate', content: 'hi' })).statusCode).toBe(200)
     expect((await postMessage({ from: 'localboss', to: 'teodor/kutato', content: 'hi' })).statusCode).toBe(200)
+  })
+
+  it('rejects an unregistered display label instead of creating a phantom local agent', async () => {
+    const r = await postMessage({ from: 'localboss', to: 'Synthetic Display Label', content: 'hi' })
+    expect(r.statusCode).toBe(400)
+    expect(r.json.error).toMatch(/Unknown local agentId/)
   })
 })
 

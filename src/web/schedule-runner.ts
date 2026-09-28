@@ -90,6 +90,9 @@ import { detectsFirstRunGate, detectPaneState, overfullParkedInputTail, type Pan
 import { getInjectedPrompt, matchesInjectedPrompt, type InjectedPromptRecord } from './injected-prompt-registry.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
+import { usesCodex, queueCodexScheduledTask, codexScheduledDeliveries } from '../codex-backend.js'
+import { getCodexDeliveryStore, type CodexDelivery } from '../codex-delivery.js'
+import { getDeliveryRecoveryStore, sendDurableNotice } from '../codex-recovery.js'
 
 // How many bare-Enter attempts the post-send resubmit tries before escalating
 // to a clear + re-inject, and the hard cap after which it gives up.
@@ -1074,6 +1077,7 @@ async function attemptFireTask(
   now: number,
   preCheckPrefix?: string,
   lateCatchUpMs?: number,
+  scheduledOccurrence: number = now,
 ): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run'> {
   const { session, host } = resolveTaskTarget(task, agentName)
   // resolveTaskTarget() computes this internally but does not expose it (it
@@ -1312,6 +1316,23 @@ async function attemptFireTask(
       SCHEDULED_TASK_PREAMBLE + '\n' +
       prefix.trimEnd() + '\n\n' +
       scheduledTaskBlock
+    if (isMainAgent && usesCodex() && !host && session === MAIN_CHANNELS_SESSION) {
+      // One SQLite transaction owns both the durable queue item and its task_run.
+      // The Codex host claims the queued row itself, including after a restart.
+      const { delivery, created } = queueCodexScheduledTask({
+        taskId: task.name,
+        agentId: agentName,
+        scheduledOccurrence,
+        prompt: fullPrompt,
+        queuedAt: now,
+        late: lateCatchUpMs != null,
+      })
+      scheduleLastRun.set(task.name, now)
+      persistScheduleLastRun()
+      logger.info({ task: task.name, agent: agentName, deliveryId: delivery.deliveryId, created },
+        'Scheduled Codex delivery durably queued (or existing occurrence reused)')
+      return 'fired'
+    }
     let typedAt = Date.now() // replaced by onEmitStart; see the note after the call
     // forceSend skips the busy-state check above; it must also skip the
     // pre-flight wait-until-idle gate inside sendPromptToSession, otherwise a
@@ -1659,7 +1680,7 @@ export async function runScheduledTaskNow(
     // redundant cron ticks, but an explicit run-now must not be dropped.
     if (result === 'starting' || result === 'busy' || result === 'mcp-missing' || result === 'first-run') {
       const reason = result === 'mcp-missing' ? mcpMissingReason(task.name, agentName) : result
-      insertPendingTaskRetryIfNew(task.name, agentName, now, reason)
+      insertPendingTaskRetryIfNew(task.name, agentName, now, reason, now)
     }
     summary.push(`${agentName}: ${result}`)
   }
@@ -2086,12 +2107,80 @@ function sendTaskTimeoutAlert(entry: TaskInflightEntry, elapsedMs: number): void
   })()
 }
 
+export function codexDeliveryNeedsNotice(
+  delivery: Pick<CodexDelivery, 'status' | 'queuedAt' | 'startedAt'>,
+  now: number,
+  timeoutMs: number,
+): boolean {
+  if (delivery.status === 'failed' || delivery.status === 'interrupted') return true
+  if (delivery.status === 'completed') return false
+  return now - (delivery.startedAt ?? delivery.queuedAt) >= timeoutMs
+}
+
+async function sendCodexDeliveryOwnerAlert(text: string): Promise<void> {
+  const token = resolveSchedulerAlertToken()
+  const chat = resolveSchedulerOwnerChat()
+  if (!token || !chat) {
+    logger.warn('Codex delivery alert cannot reach the owner: channel token or owner chat missing')
+    throw Object.assign(new Error('Notification channel unavailable'), {definitelyNotSent: true})
+  }
+  await sendSchedulerAlertMessage(token, chat, text)
+}
+
+async function monitorCodexDeliveries(tasks: ScheduledTask[], now: number): Promise<void> {
+  if (!usesCodex()) return
+  try {
+    const store = getCodexDeliveryStore()
+    for (const delivery of codexScheduledDeliveries()) {
+      const task = tasks.find(t => t.name === delivery.taskId)
+      const timeoutMs = resolveStuckTimeoutMs(task ?? {})
+      if (!codexDeliveryNeedsNotice(delivery, now, timeoutMs)) continue
+      // Claim sending before I/O; sent only follows a confirmed acknowledgement.
+      const recovery = getDeliveryRecoveryStore()
+      const notice = recovery.prepareNotice(delivery.deliveryId, now)
+      if (notice.status !== 'pending') continue
+      markScheduledTaskKanbanWaiting(delivery.taskId)
+      const text = `[${BOT_NAME} scheduler] Codex feladat vizsgalatot igenyel: ${delivery.taskId} ` +
+        `(${delivery.agentId}), delivery ${delivery.deliveryId}, allapot ${delivery.status}. ` +
+        `Nem indul ujra automatikusan. ${delivery.errorCode ? `Hibakod: ${delivery.errorCode}.` : ''}`
+      try {
+        await sendDurableNotice(recovery, notice.notificationId, () => sendCodexDeliveryOwnerAlert(text))
+      } catch (err) {
+        logger.warn({ err, notificationId: notice.notificationId }, 'Notification delivery unconfirmed; durable state requires review; no resend')
+      }
+    }
+    // A row without its delivery is a corruption/partial-migration case. It
+    // cannot safely be replayed. Closing that run is the one-time durable
+    // alert claim, while the Kanban card remains waiting for manual review.
+    for (const unknown of store.listUnknownRuns()) {
+      const recovery = getDeliveryRecoveryStore()
+      const notice = recovery.prepareNotice(`orphan-run:${unknown.taskRunId}`, now)
+      if (notice.status !== 'pending') continue
+      markScheduledTaskKanbanWaiting(unknown.taskId)
+      const text = `[${BOT_NAME} scheduler] Ismeretlen Codex kezbesitesi allapot: ` +
+        `${unknown.taskId} (${unknown.agentId}), task_run ${unknown.taskRunId}. Kezi vizsgalat szukseges; nem indul ujra.`
+      try {
+        await sendDurableNotice(recovery, notice.notificationId, () => sendCodexDeliveryOwnerAlert(text))
+        markTaskRunCompleted(unknown.taskRunId, 'interrupted', now)
+      }
+      catch (err) { logger.warn({ err, runId: unknown.taskRunId }, 'Unknown Codex delivery alert failed') }
+    }
+  } catch (err) {
+    logger.error({ err }, 'Codex delivery monitor failed; automatic replay remains disabled')
+  }
+}
+
 // Tick interval for the schedule runner. 15 s gives 4x faster inter-agent
 // message delivery and scheduled-task triggering; each tick is a cheap
 // SQLite SELECT so the load is negligible.
 export const SCHEDULE_TICK_MS = 15_000
 
 export function startScheduleRunner(): NodeJS.Timeout {
+  if (usesCodex()) {
+    const count = getDeliveryRecoveryStore().recoverNotices()
+    const unconfirmed = getDeliveryRecoveryStore().listUnconfirmed()
+    if (count || unconfirmed.length) logger.warn({ count, notifications: unconfirmed.map(n => ({ notificationId: n.notificationId, status: n.status })) }, 'Notification sends require manual review; no resend')
+  }
   // Close EVERY run that the previous process was still watching when it
   // stopped. taskInflightMap is in memory, so a restart loses every open entry
   // and nothing else can ever close those rows (SCHEDSORZAR923: an age window
@@ -2182,6 +2271,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
     try {
     const tasks = listScheduledTasks()
     const now = Date.now()
+    await monitorCodexDeliveries(tasks, now)
     // Scan the real interval elapsed since the previous tick (30 min on the
     // first tick), not a fixed 60s window -- a late/dropped tick must not let a
     // sparse daily cron's single occurrence slip through a gap unscanned (#621).
@@ -2395,8 +2485,16 @@ export function startScheduleRunner(): NodeJS.Timeout {
         continue
       }
 
+      // Missing occurrence is not evidence of a new task. Never infer it from first_attempt.
+      if (usesCodex() && row.agent_name === MAIN_AGENT_ID && row.scheduled_occurrence == null) {
+        if (row.last_reason !== 'codex-occurrence-manual-review') {
+          updatePendingTaskRetry(row.task_name, row.agent_name, now, 'codex-occurrence-manual-review')
+          logger.warn({task: row.task_name}, 'Legacy retry lacks occurrence; manual review required; no replay')
+        }
+        continue
+      }
       const view = toPendingRetryView(row, now)
-      const result = await attemptFireTask(taskDef, row.agent_name, now, retryPc.prefix)
+      const result = await attemptFireTask(taskDef, row.agent_name, now, retryPc.prefix, undefined, row.scheduled_occurrence ?? now)
       if (result === 'fired') {
         deletePendingTaskRetry(row.task_name, row.agent_name)
         continue
@@ -2611,14 +2709,14 @@ export function startScheduleRunner(): NodeJS.Timeout {
         // If already queued for retry from an earlier tick, leave it to
         // the retry handler -- don't re-queue or double-fire.
         if (pendingKeys.has(key)) continue
-        const result = await attemptFireTask(task, agentName, now, cronPc.prefix, lateCatchUpMs)
+        const result = await attemptFireTask(task, agentName, now, cronPc.prefix, lateCatchUpMs, occurrenceMs)
         if (result === 'starting') {
           // Agent was auto-started this tick. ALWAYS enqueue the retry that
           // delivers the prompt once the session is ready -- skipIfBusy must
           // NOT drop it (that flag is for genuinely-busy short-cadence tasks;
           // here we deliberately woke the agent for its scheduled run). The
           // pending-retry loop then sends as soon as Claude has booted.
-          insertPendingTaskRetryIfNew(task.name, agentName, now, 'starting')
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'starting', occurrenceMs)
         } else if (result === 'busy') {
           // A forceSend task only ever reports 'busy' from the context-
           // saturation deferral inside attemptFireTask -- every other busy
@@ -2640,20 +2738,24 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // First encounter -- insert a new pending row. If somehow a
           // row already exists (race with a just-cancelled retry), do
           // nothing so the cancel wins the tiebreak.
-          insertPendingTaskRetryIfNew(task.name, agentName, now, 'busy')
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'busy', occurrenceMs)
         } else if (result === 'mcp-missing') {
           // Deliberately NOT honoring skipIfBusy here: dropping a tick because
           // a required MCP is dead would be exactly the silent starvation this
           // pre-check exists to eliminate. The retry row keeps the task alive
           // until the server returns, and the alert names the dead server.
-          insertPendingTaskRetryIfNew(task.name, agentName, now, mcpMissingReason(task.name, agentName))
+          insertPendingTaskRetryIfNew(task.name, agentName, now, mcpMissingReason(task.name, agentName), occurrenceMs)
         } else if (result === 'first-run') {
           // Also exempt from skipIfBusy: a session parked on a first-run
           // dialog (fresh install) never frees up between ticks the way a
           // busy one does, so dropping ticks would starve the task with no
           // trace. The retry row keeps it alive and the aged alert names the
           // actual blocker instead of a generic "busy".
-          insertPendingTaskRetryIfNew(task.name, agentName, now, 'first-run')
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'first-run', occurrenceMs)
+        } else if (result === 'error' && agentName === MAIN_AGENT_ID && usesCodex()) {
+          // A DB/queue write failed before a delivery was committed. Retain the
+          // occurrence for retry; no Codex work can have started in this path.
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'codex-queue-error', occurrenceMs)
         }
       }
     }

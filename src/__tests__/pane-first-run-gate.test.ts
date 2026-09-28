@@ -289,7 +289,9 @@ describe('first-run gate wiring contracts', () => {
   })
 
   it("'first-run' is exempt from skipIfBusy (queued like mcp-missing, never dropped)", () => {
-    expect(SCHEDULE_RUNNER).toMatch(/result === 'first-run'[\s\S]{0,700}?insertPendingTaskRetryIfNew\(task\.name, agentName, now, 'first-run'\)/)
+    // The cron branch must persist the original occurrence exactly; this is
+    // an identity assertion, not an argument-count relaxation.
+    expect(SCHEDULE_RUNNER).toMatch(/result === 'first-run'[\s\S]{0,700}?insertPendingTaskRetryIfNew\(task\.name, agentName, now, 'first-run', occurrenceMs\)/)
   })
 
   it('the channel-monitor answers first-run dialogs instead of sending Escape', () => {

@@ -3,9 +3,25 @@ import { join } from 'node:path'
 import { connect } from 'node:net'
 import { spawn } from 'node:child_process'
 import { PROJECT_ROOT, STORE_DIR } from './config.js'
+import { getCodexDeliveryStore, type CodexDelivery } from './codex-delivery.js'
 
 export function usesCodex(): boolean {
   return process.env.MARVEEN_AGENT_BACKEND === 'codex'
+}
+
+export function queueCodexScheduledTask(input: {
+  taskId: string
+  agentId: string
+  scheduledOccurrence: number
+  prompt: string
+  queuedAt: number
+  late: boolean
+}): { delivery: CodexDelivery; created: boolean } {
+  return getCodexDeliveryStore().prepare(input)
+}
+
+export function codexScheduledDeliveries(): CodexDelivery[] {
+  return getCodexDeliveryStore().listMonitorable()
 }
 
 export function codexPane(): string | null {
