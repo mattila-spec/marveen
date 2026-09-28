@@ -1057,6 +1057,8 @@ export function detectPaneState(
   opts: DetectPaneStateOptions = {},
 ): PaneState {
   if (!pane || !pane.trim()) return 'unknown'
+  if (pane.trim() === '[marveen-codex:ready]') return 'idle'
+  if (pane.trim() === '[marveen-codex:busy]') return 'busy'
 
   const paneLines = pane.split('\n')
 

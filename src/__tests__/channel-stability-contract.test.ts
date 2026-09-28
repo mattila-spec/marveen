@@ -117,10 +117,19 @@ describe('P2#5 — dashboard restart routes the main agent through respawn-pane 
     expect(agents).toMatch(/isMainChannelsAgent\(name\)/)
     expect(agents).toMatch(/hardRestartMarveenChannels\(\)/)
   })
-  it('hardRestartMarveenChannels never systemctl-restarts (respawn-pane only on Linux)', () => {
+  it('hardRestartMarveenChannels never systemctl-restarts and isolates Codex to its pane', () => {
     const cm = stripTsComments(read('src/web/channel-monitor.ts'))
-    // The function must not shell out to `systemctl --user restart` for the unit.
-    expect(cm).not.toMatch(/systemctl[^\n]*restart/)
+    const start = cm.indexOf('export function hardRestartMarveenChannels')
+    const end = cm.indexOf('\nfunction maybeRestartWedgedMainChannel', start)
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    const restartFn = cm.slice(start, end)
+    // Scope the assertion to the function: status/help text elsewhere may
+    // legitimately mention systemctl, but no restart execution belongs here.
+    expect(restartFn).not.toMatch(/execFileSync\(['"]systemctl['"][\s\S]*?restart/)
+    expect(restartFn).toMatch(/MARVEEN_AGENT_BACKEND === 'codex'[\s\S]*?respawn-pane/)
+    expect(restartFn).toMatch(/codex-channels\.sh[\s\S]*?--pane/)
+    expect(read('scripts/codex-channels.sh')).toMatch(/if \[ "\$\{1:-\}" = "--pane" \][\s\S]*?exec node scripts\/codex-channels\.mjs/)
   })
 })
 

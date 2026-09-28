@@ -557,12 +557,12 @@ export async function runMessageRouterTick(): Promise<void> {
       // The watcher does the same job correctly (double-capture-confirmed idle,
       // abort-on-busy send, stale-spell escalation, owner alert, hourly budget),
       // so the router simply leaves the row for the PULL path to claim.
-      if (isMainAgent) continue
+      if (isMainAgent && process.env.MARVEEN_AGENT_BACKEND !== 'codex') continue
       // Use cached session data from the pre-pass (one sessionExistsOnHost call
       // per unique receiver per tick). Fall back to a direct call for agents not
       // in the pending set (shouldn't happen, but safe).
       const cached = agentSessionCache.get(msg.to_agent)
-      const session = cached?.session ?? agentSessionName(msg.to_agent)
+      const session = isMainAgent ? `${MAIN_AGENT_ID}-channels` : cached?.session ?? agentSessionName(msg.to_agent)
       const host = isMainAgent ? null : cached?.host ?? readAgentRemoteHost(msg.to_agent)
       const sessionExists = cached?.exists ?? sessionExistsOnHost(host, session)
       // Opt-in queue delivery. EVERY tmux-shaped gate below is skipped for these
@@ -1046,4 +1046,3 @@ async function callVoiceSTT(fileId: string, agentId: string): Promise<string | n
     return null
   }
 }
-

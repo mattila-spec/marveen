@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync, renameSync, statSync, chmodSync, mkdtempSync, unlinkSync } from 'node:fs'
 import { encodeClaudeProjectDir } from '../claude-project-dir.js'
+import { usesCodex, codexPane, sendCodexPrompt } from '../codex-backend.js'
 import { join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
@@ -3363,6 +3364,10 @@ export async function sendPromptToSession(
   host: string | null = null,
   opts: { waitForIdle?: boolean; onBusyTimeout?: 'send' | 'abort'; idleTimeoutMs?: number; lockMode?: SendLockMode; onBusySend?: () => void; onEmitStart?: () => void } = {},
 ): Promise<'sent' | 'aborted-busy' | 'skipped-locked'> {
+  if (usesCodex() && !host && session === MAIN_CHANNELS_SESSION) {
+    await sendCodexPrompt(text)
+    return 'sent'
+  }
   const lockMode: SendLockMode = opts.lockMode ?? 'deliver'
   // PANEWRITERS805: the three modal dismissals are probe+act keystroke writers
   // that ran BEFORE the lane lock -- so they could press Escape/Enter into a
@@ -3645,6 +3650,7 @@ export async function waitForPaneSettle(
 }
 
 export function capturePane(session: string, host: string | null = null): string | null {
+  if (usesCodex() && !host && session === MAIN_CHANNELS_SESSION) return codexPane()
   try {
     // Capture WITH colour, strip a trailing /rename session-title banner, then
     // remove all remaining ANSI. For a pane without a banner this is byte-for-byte
@@ -3765,6 +3771,7 @@ export function saturationRefusesDispatch(capture: string, session: string): boo
 }
 
 export async function isSessionReadyForPrompt(session: string, host: string | null = null): Promise<boolean> {
+  if (usesCodex() && !host && session === MAIN_CHANNELS_SESSION) return codexPane() === '[marveen-codex:ready]'
   // Dim-ghost tolerant idle read: CC >=2.1.202 paints a dim placeholder into
   // the empty input box, which a plain capture reads as parked text. Only when
   // the plain view says 'typing' do we pay for the second (-e, dim-stripped)
@@ -4172,4 +4179,3 @@ async function clearStaleParkedInputInLane(
   logger.warn({ session, parked: parked.slice(0, 60) }, 'message-router: cleared stale parked input (channel un-wedge)')
   return true
 }
-
