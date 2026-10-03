@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ScheduledTask } from '../web/scheduled-tasks-io.js'
+import { createCodexSchedulerTestStores } from './fixtures/codex-scheduler-test-stores.js'
 
 // A pending retry whose target session is MISSING (and whose auto-start fails)
 // must survive the tick, not be deleted. Deleting it was a silent abandonment
@@ -136,11 +137,16 @@ async function loadRunner() {
 
 async function runOneTick() {
   const { startScheduleRunner } = await loadRunner()
-  const stop = startScheduleRunner()
+  const stores = createCodexSchedulerTestStores()
+  const stop = startScheduleRunner(stores)
   // First tick is scheduled, not immediate: advance past the 60s interval and
   // let the async tick body drain.
-  await vi.advanceTimersByTimeAsync(61_000)
-  clearInterval(stop)
+  try {
+    await vi.advanceTimersByTimeAsync(61_000)
+  } finally {
+    clearInterval(stop)
+    stores.close()
+  }
 }
 
 describe('schedule runner: pending retry survives a missing target session', () => {

@@ -15,6 +15,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ScheduledTask } from '../web/scheduled-tasks-io.js'
+import { createCodexSchedulerTestStores } from './fixtures/codex-scheduler-test-stores.js'
 
 const mockAppendTaskRun = vi.fn()
 // Mirrors the real DB: a fired retry's delete removes the row, so the next
@@ -128,9 +129,14 @@ function retryRow(overrides: Record<string, unknown> = {}) {
 async function runOneTick() {
   vi.resetModules()
   const { startScheduleRunner } = await import('../web/schedule-runner.js')
-  const stop = startScheduleRunner()
-  await vi.advanceTimersByTimeAsync(61_000)
-  clearInterval(stop)
+  const stores = createCodexSchedulerTestStores()
+  const stop = startScheduleRunner(stores)
+  try {
+    await vi.advanceTimersByTimeAsync(61_000)
+  } finally {
+    clearInterval(stop)
+    stores.close()
+  }
 }
 
 describe('schedule runner: modal cleared on the refusal branch -> the task fires', () => {

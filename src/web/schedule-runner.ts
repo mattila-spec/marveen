@@ -91,8 +91,8 @@ import { getInjectedPrompt, matchesInjectedPrompt, type InjectedPromptRecord } f
 import { withSessionSendLock } from './session-send-lock.js'
 import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
 import { usesCodex, queueCodexScheduledTask, codexScheduledDeliveries } from '../codex-backend.js'
-import { getCodexDeliveryStore, type CodexDelivery } from '../codex-delivery.js'
-import { getDeliveryRecoveryStore, sendDurableNotice } from '../codex-recovery.js'
+import { getCodexDeliveryStore, type CodexDelivery, type CodexDeliveryStore } from '../codex-delivery.js'
+import { getDeliveryRecoveryStore, sendDurableNotice, type DeliveryRecoveryStore } from '../codex-recovery.js'
 
 // How many bare-Enter attempts the post-send resubmit tries before escalating
 // to a clear + re-inject, and the hard cap after which it gives up.
@@ -1078,6 +1078,7 @@ async function attemptFireTask(
   preCheckPrefix?: string,
   lateCatchUpMs?: number,
   scheduledOccurrence: number = now,
+  codexStore?: CodexDeliveryStore,
 ): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run'> {
   const { session, host } = resolveTaskTarget(task, agentName)
   // resolveTaskTarget() computes this internally but does not expose it (it
@@ -1326,7 +1327,7 @@ async function attemptFireTask(
         prompt: fullPrompt,
         queuedAt: now,
         late: lateCatchUpMs != null,
-      })
+      }, codexStore)
       scheduleLastRun.set(task.name, now)
       persistScheduleLastRun()
       logger.info({ task: task.name, agent: agentName, deliveryId: delivery.deliveryId, created },
@@ -1652,7 +1653,7 @@ export function startHeartbeatGapGuard(): ReturnType<typeof setInterval> {
 
 export async function runScheduledTaskNow(
   taskName: string,
-  opts: { allowDisabled?: boolean } = {},
+  opts: { allowDisabled?: boolean; codexDeliveryStore?: CodexDeliveryStore } = {},
 ): Promise<{ ok: boolean; result?: string; error?: string }> {
   const task = listScheduledTasks().find(t => t.name === taskName)
   if (!task) return { ok: false, error: 'Schedule not found' }
@@ -1673,7 +1674,7 @@ export async function runScheduledTaskNow(
 
   const summary: string[] = []
   for (const agentName of targets) {
-    const result = await attemptFireTask(task, agentName, now)
+    const result = await attemptFireTask(task, agentName, now, undefined, undefined, now, opts.codexDeliveryStore)
     // A manual run ALWAYS wants delivery: an auto-started ('starting') or a
     // busy session both get a queued retry that lands once the session is
     // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
@@ -2127,16 +2128,19 @@ async function sendCodexDeliveryOwnerAlert(text: string): Promise<void> {
   await sendSchedulerAlertMessage(token, chat, text)
 }
 
-async function monitorCodexDeliveries(tasks: ScheduledTask[], now: number): Promise<void> {
+export async function monitorCodexDeliveries(
+  tasks: ScheduledTask[],
+  now: number,
+  store: CodexDeliveryStore,
+  recovery: DeliveryRecoveryStore,
+): Promise<void> {
   if (!usesCodex()) return
   try {
-    const store = getCodexDeliveryStore()
-    for (const delivery of codexScheduledDeliveries()) {
+    for (const delivery of store.listMonitorable()) {
       const task = tasks.find(t => t.name === delivery.taskId)
       const timeoutMs = resolveStuckTimeoutMs(task ?? {})
       if (!codexDeliveryNeedsNotice(delivery, now, timeoutMs)) continue
       // Claim sending before I/O; sent only follows a confirmed acknowledgement.
-      const recovery = getDeliveryRecoveryStore()
       const notice = recovery.prepareNotice(delivery.deliveryId, now)
       if (notice.status !== 'pending') continue
       markScheduledTaskKanbanWaiting(delivery.taskId)
@@ -2153,7 +2157,6 @@ async function monitorCodexDeliveries(tasks: ScheduledTask[], now: number): Prom
     // cannot safely be replayed. Closing that run is the one-time durable
     // alert claim, while the Kanban card remains waiting for manual review.
     for (const unknown of store.listUnknownRuns()) {
-      const recovery = getDeliveryRecoveryStore()
       const notice = recovery.prepareNotice(`orphan-run:${unknown.taskRunId}`, now)
       if (notice.status !== 'pending') continue
       markScheduledTaskKanbanWaiting(unknown.taskId)
@@ -2175,10 +2178,16 @@ async function monitorCodexDeliveries(tasks: ScheduledTask[], now: number): Prom
 // SQLite SELECT so the load is negligible.
 export const SCHEDULE_TICK_MS = 15_000
 
-export function startScheduleRunner(): NodeJS.Timeout {
+export function startScheduleRunner(stores: {
+  codexDeliveryStore?: CodexDeliveryStore
+  deliveryRecoveryStore?: DeliveryRecoveryStore
+} = {}): NodeJS.Timeout {
+  const codexStore = () => stores.codexDeliveryStore ?? getCodexDeliveryStore()
+  const recoveryStore = () => stores.deliveryRecoveryStore ?? getDeliveryRecoveryStore()
   if (usesCodex()) {
-    const count = getDeliveryRecoveryStore().recoverNotices()
-    const unconfirmed = getDeliveryRecoveryStore().listUnconfirmed()
+    const recovery = recoveryStore()
+    const count = recovery.recoverNotices()
+    const unconfirmed = recovery.listUnconfirmed()
     if (count || unconfirmed.length) logger.warn({ count, notifications: unconfirmed.map(n => ({ notificationId: n.notificationId, status: n.status })) }, 'Notification sends require manual review; no resend')
   }
   // Close EVERY run that the previous process was still watching when it
@@ -2271,7 +2280,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
     try {
     const tasks = listScheduledTasks()
     const now = Date.now()
-    await monitorCodexDeliveries(tasks, now)
+    if (usesCodex()) await monitorCodexDeliveries(tasks, now, codexStore(), recoveryStore())
     // Scan the real interval elapsed since the previous tick (30 min on the
     // first tick), not a fixed 60s window -- a late/dropped tick must not let a
     // sparse daily cron's single occurrence slip through a gap unscanned (#621).
@@ -2494,7 +2503,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         continue
       }
       const view = toPendingRetryView(row, now)
-      const result = await attemptFireTask(taskDef, row.agent_name, now, retryPc.prefix, undefined, row.scheduled_occurrence ?? now)
+      const result = await attemptFireTask(taskDef, row.agent_name, now, retryPc.prefix, undefined, row.scheduled_occurrence ?? now, stores.codexDeliveryStore)
       if (result === 'fired') {
         deletePendingTaskRetry(row.task_name, row.agent_name)
         continue
@@ -2709,7 +2718,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         // If already queued for retry from an earlier tick, leave it to
         // the retry handler -- don't re-queue or double-fire.
         if (pendingKeys.has(key)) continue
-        const result = await attemptFireTask(task, agentName, now, cronPc.prefix, lateCatchUpMs, occurrenceMs)
+        const result = await attemptFireTask(task, agentName, now, cronPc.prefix, lateCatchUpMs, occurrenceMs, stores.codexDeliveryStore)
         if (result === 'starting') {
           // Agent was auto-started this tick. ALWAYS enqueue the retry that
           // delivers the prompt once the session is ready -- skipIfBusy must

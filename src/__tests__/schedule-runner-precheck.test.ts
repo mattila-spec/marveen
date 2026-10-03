@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { describe, expect, it, vi } from 'vitest'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { runPreCheck } from '../web/schedule-runner.js'
+import { queueCodexScheduledTask } from '../codex-backend.js'
+import type { CodexDeliveryStore } from '../codex-delivery.js'
 import type { ScheduledTask } from '../web/scheduled-tasks-io.js'
 
 // Tests for the heartbeat pre-check mechanism (#234).
@@ -117,15 +119,45 @@ describe('schedule-runner pre-check integration (source-level)', () => {
   })
 
   it('passes preCheckPrefix and the original occurrence to attemptFireTask in the cron loop', () => {
-    expect(SRC).toMatch(/attemptFireTask\(task, agentName, now, cronPc\.prefix, lateCatchUpMs, occurrenceMs\)/)
+    const cronLoopIdx = SRC.indexOf('for (const task of tasks)')
+    const cronLoop = SRC.slice(cronLoopIdx)
+    expect(cronLoop).toMatch(
+      /attemptFireTask\(task, agentName, now, cronPc\.prefix, lateCatchUpMs, occurrenceMs, stores\.codexDeliveryStore\)/,
+    )
   })
 
   it('retry uses persisted occurrence and never first_attempt as delivery identity', () => {
     const retryLoopIdx = SRC.indexOf('for (const row of pendingRows)')
     const retryLoop = SRC.slice(retryLoopIdx, SRC.indexOf('for (const task of tasks)'))
-    expect(retryLoop).toMatch(/attemptFireTask\(taskDef, row\.agent_name, now, retryPc\.prefix, undefined, row\.scheduled_occurrence \?\? now\)/)
+    expect(retryLoop).toMatch(
+      /attemptFireTask\(taskDef, row\.agent_name, now, retryPc\.prefix, undefined, row\.scheduled_occurrence \?\? now, stores\.codexDeliveryStore\)/,
+    )
     expect(retryLoop).not.toMatch(/attemptFireTask\([^\n]*row\.first_attempt/)
     expect(retryLoop).toMatch(/Legacy retry lacks occurrence; manual review required; no replay/)
+  })
+
+  it('uses the same injected delivery store for startup recovery and monitoring', () => {
+    expect(SRC).toMatch(/const codexStore = \(\) => stores\.codexDeliveryStore \?\? getCodexDeliveryStore\(\)/)
+    expect(SRC).toMatch(/const recoveryStore = \(\) => stores\.deliveryRecoveryStore \?\? getDeliveryRecoveryStore\(\)/)
+    expect(SRC).toMatch(/const recovery = recoveryStore\(\)\s+const count = recovery\.recoverNotices\(\)/)
+    expect(SRC).toMatch(/monitorCodexDeliveries\(tasks, now, codexStore\(\), recoveryStore\(\)\)/)
+  })
+
+  it('forwards an explicitly injected store instance without opening the implicit repository DB', () => {
+    const dbMarkers = ['store/claudeclaw.db', 'store/claudeclaw.db-wal', 'store/claudeclaw.db-shm']
+    expect(dbMarkers.some(path => existsSync(join(process.cwd(), path)))).toBe(false)
+    const delivery = { deliveryId: 'isolated-fixture-delivery' }
+    const prepare = vi.fn(() => ({ delivery, created: true }))
+    const injectedStore = { prepare } as unknown as CodexDeliveryStore
+    const input = {
+      taskId: 'precheck-fixture', agentId: 'marveen', scheduledOccurrence: 1_800_000,
+      prompt: 'fixture prompt', queuedAt: 1_800_100, late: false,
+    }
+
+    expect(queueCodexScheduledTask(input, injectedStore)).toEqual({ delivery, created: true })
+    expect(prepare).toHaveBeenCalledOnce()
+    expect(prepare).toHaveBeenCalledWith(input)
+    expect(dbMarkers.some(path => existsSync(join(process.cwd(), path)))).toBe(false)
   })
 
   it('skips and records the run when pre-check returns skip in cron loop', () => {

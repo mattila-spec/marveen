@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ScheduledTask } from '../web/scheduled-tasks-io.js'
+import { createCodexSchedulerTestStores } from './fixtures/codex-scheduler-test-stores.js'
 
 // SCHEDPARK814. A scheduled task can be deferred forever by a session that is
 // not working at all: an interrupted turn can leave a FRAGMENT of an earlier
@@ -127,9 +128,14 @@ function retryRow(ageMs: number, overrides: Record<string, unknown> = {}) {
 async function runOneTick() {
   vi.resetModules()
   const { startScheduleRunner } = await import('../web/schedule-runner.js')
-  const stop = startScheduleRunner()
-  await vi.advanceTimersByTimeAsync(16_000)
-  clearInterval(stop)
+  const stores = createCodexSchedulerTestStores()
+  const stop = startScheduleRunner(stores)
+  try {
+    await vi.advanceTimersByTimeAsync(16_000)
+  } finally {
+    clearInterval(stop)
+    stores.close()
+  }
 }
 
 describe('schedule runner: stale-parked-input janitor on the retry queue', () => {
