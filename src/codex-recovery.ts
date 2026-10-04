@@ -43,6 +43,9 @@ export class DeliveryRecoveryStore {
   getChannel(id: string): ChannelRecord | null {
     return (this.db.prepare('SELECT delivery_id AS deliveryId,payload,internal,status,review_state AS reviewState,attempt_count AS attemptCount FROM codex_channel_deliveries WHERE delivery_id=?').get(id) as ChannelRecord) ?? null
   }
+  hasActiveChannels(): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM codex_channel_deliveries WHERE status IN ('queued','running') LIMIT 1").get())
+  }
   prepareChannel(item: any, knownUnstarted = false, now = Date.now()): ChannelRecord {
     const meta = item?.params?.meta
     const valid = meta?.chat_id && typeof item?.params?.content === 'string'

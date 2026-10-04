@@ -31,6 +31,15 @@ describe('durable channel recovery',()=>{
       expect(restart.getChannel(a.deliveryId)?.attemptCount).toBe(1)
     } finally {restart.close()}
   }))
+  it('keeps rotation deferred while any durable channel delivery is queued or running',()=>fixture(store=>{
+    expect(store.hasActiveChannels()).toBe(false)
+    const row=store.prepareChannel(item,true)
+    expect(store.hasActiveChannels()).toBe(true)
+    store.claimChannel(false)
+    expect(store.hasActiveChannels()).toBe(true)
+    store.finishChannel(row.deliveryId,'completed')
+    expect(store.hasActiveChannels()).toBe(false)
+  }))
   it('finished work deduplicates new intake after restart',()=>fixture((store,path)=>{
     const a=store.prepareChannel(item,true);store.claimChannel(false);store.finishChannel(a.deliveryId,'completed')
     const other=new DeliveryRecoveryStore(path)
