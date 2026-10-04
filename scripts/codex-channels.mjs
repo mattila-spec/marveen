@@ -281,8 +281,6 @@ async function drain() {
 }
 async function drainLane(lane) {
   if (!ready || lane.processing || stopping) return
-  lane.processing = true
-  status()
   try {
     while (!stopping) {
       const channelDelivery = recoveryStore.claimChannel(lane.internal)
@@ -301,6 +299,12 @@ async function drainLane(lane) {
         params: {meta: {chat_id: ownerChatId, source: 'dashboard'}, content: delivery.prompt},
       } : null)
       if (!item) break
+      // Claiming is synchronous, so no competing drain can enter between the
+      // initial guard and this assignment. Do not advertise an idle poll as
+      // busy: status.json is watched by the dashboard and an atomic busy/idle
+      // rewrite every second creates a filesystem event storm.
+      lane.processing = true
+      status()
       const chatId = String(item.params.meta.chat_id)
       try {
         const command = !item.internal ? parseBotCommand(item.params.content, process.env.MARVEEN_TELEGRAM_BOT_USERNAME ?? '') : null
