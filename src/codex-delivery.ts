@@ -74,6 +74,11 @@ export function scheduledCodexIdempotencyKey(taskId: string, agentId: string, oc
   return `scheduled:${agentId}:${taskId}:${occurrence}`
 }
 
+export function scheduledCodexIdentity(taskId: string, agentId: string, occurrence: number): { deliveryId: string; idempotencyKey: string } {
+  const idempotencyKey = scheduledCodexIdempotencyKey(taskId, agentId, occurrence)
+  return { deliveryId: createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 32), idempotencyKey }
+}
+
 /**
  * The queue and its task_runs ownership are committed by one SQLite transaction.
  * A crash before commit leaves neither; a crash after commit leaves a queued
@@ -126,13 +131,20 @@ export class CodexDeliveryStore {
     prompt: string
     queuedAt?: number
     late?: boolean
+    deliveryId?: string
+    idempotencyKey?: string
   }): { delivery: CodexDelivery; created: boolean } {
-    const key = scheduledCodexIdempotencyKey(input.taskId, input.agentId, input.scheduledOccurrence)
-    const deliveryId = createHash('sha256').update(key).digest('hex').slice(0, 32)
+    const identity = scheduledCodexIdentity(input.taskId, input.agentId, input.scheduledOccurrence)
+    if ((input.deliveryId && input.deliveryId !== identity.deliveryId) ||
+        (input.idempotencyKey && input.idempotencyKey !== identity.idempotencyKey)) {
+      throw new Error('Scheduled Codex delivery identity mismatch')
+    }
+    const { idempotencyKey: key, deliveryId } = identity
     return this.db.transaction(() => {
       const existingRow = this.db.prepare('SELECT * FROM codex_deliveries WHERE task_id = ? AND scheduled_occurrence = ?').get(input.taskId, input.scheduledOccurrence) as DeliveryRow | undefined
       const existing = existingRow ? toDelivery(existingRow) : null
       if (existing && existing.agentId !== input.agentId) throw new Error('Occurrence already belongs to another agent')
+      if (existing && (existing.deliveryId !== deliveryId || existing.idempotencyKey !== key)) throw new Error('Occurrence identity mismatch')
       if (existing) return { delivery: existing, created: false }
       const queuedAt = input.queuedAt ?? Date.now()
       const run = this.db.prepare(

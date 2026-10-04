@@ -90,7 +90,7 @@ import { detectsFirstRunGate, detectPaneState, overfullParkedInputTail, type Pan
 import { getInjectedPrompt, matchesInjectedPrompt, type InjectedPromptRecord } from './injected-prompt-registry.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
-import { usesCodex, queueCodexScheduledTask, codexScheduledDeliveries } from '../codex-backend.js'
+import { usesCodex, sendCodexScheduledDelivery } from '../codex-backend.js'
 import { getCodexDeliveryStore, type CodexDelivery, type CodexDeliveryStore } from '../codex-delivery.js'
 import { getDeliveryRecoveryStore, sendDurableNotice, type DeliveryRecoveryStore } from '../codex-recovery.js'
 
@@ -1318,20 +1318,20 @@ async function attemptFireTask(
       prefix.trimEnd() + '\n\n' +
       scheduledTaskBlock
     if (isMainAgent && usesCodex() && !host && session === MAIN_CHANNELS_SESSION) {
-      // One SQLite transaction owns both the durable queue item and its task_run.
-      // The Codex host claims the queued row itself, including after a restart.
-      const { delivery, created } = queueCodexScheduledTask({
+      // The stable occurrence identity crosses the private channel socket; the
+      // channel host transactionally owns the durable delivery and task_run.
+      const delivery = await sendCodexScheduledDelivery({
         taskId: task.name,
         agentId: agentName,
         scheduledOccurrence,
         prompt: fullPrompt,
         queuedAt: now,
         late: lateCatchUpMs != null,
-      }, codexStore)
+      })
       scheduleLastRun.set(task.name, now)
       persistScheduleLastRun()
-      logger.info({ task: task.name, agent: agentName, deliveryId: delivery.deliveryId, created },
-        'Scheduled Codex delivery durably queued (or existing occurrence reused)')
+      logger.info({ task: task.name, agent: agentName, deliveryId: delivery.deliveryId, created: delivery.created,
+        status: delivery.status }, 'Scheduled Codex delivery durably queued (or existing occurrence reused)')
       return 'fired'
     }
     let typedAt = Date.now() // replaced by onEmitStart; see the note after the call

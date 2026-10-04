@@ -11,6 +11,8 @@ import { DEFAULT_MODEL, escalationTool, economyInstructions, EconomySession } fr
 import { CodexDeliveryStore, getCodexDeliveryStore } from '../dist/codex-delivery.js'
 import { DeliveryRecoveryStore, getDeliveryRecoveryStore } from '../dist/codex-recovery.js'
 import { randomUUID } from 'node:crypto'
+import { channelApprovalSettings } from './lib/codex-channel-approvals.mjs'
+import { acceptScheduledDelivery } from '../dist/codex-channel-scheduled-delivery.js'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const bridgeTest = process.argv.includes('--bridge-test')
@@ -134,7 +136,7 @@ async function closeCodex(previous) {
 
 async function threadFor(codex, chatId, internal = false) {
   const params = {
-    cwd: root, approvalPolicy: 'never', sandbox: smoke ? 'read-only' : 'workspace-write',
+    cwd: root, ...channelApprovalSettings({ internal }), sandbox: smoke ? 'read-only' : 'workspace-write',
     developerInstructions: smoke ? 'Reply with exactly CODEX_OK. Do not use tools.' : instructions(internal),
     config: { mcp_servers: mcpConfig(internal), forced_login_method: 'chatgpt', 'sandbox_workspace_write.network_access': true },
     dynamicTools: [...tools.map(t => ({ type: 'function', name: `telegram_${t.name}`, description: t.description ?? t.name, inputSchema: t.inputSchema })), escalationTool],
@@ -294,10 +296,21 @@ try {
         if (data.length > 1_000_000) return socket.destroy()
         if (!data.includes('\n')) return
         try {
-          const {text} = JSON.parse(data.split('\n')[0])
+          const request = JSON.parse(data.split('\n')[0])
           const owner = resolveOwnerChatId()
+          if (request.type === 'scheduled_delivery') {
+            const result = acceptScheduledDelivery(deliveryStore, request)
+            if (!result.ok) throw new Error(result.error)
+            socket.end(JSON.stringify(result) + '\n')
+            void drain()
+            return
+          }
+          if (request.deliveryId || request.idempotencyKey || request.scheduledOccurrence != null) {
+            throw new Error('Incomplete scheduled delivery request')
+          }
+          const {text} = request
           if (!owner || typeof text !== 'string' || !text.trim()) throw new Error('Invalid prompt or owner chat missing')
-          recoveryStore.prepareChannel({key: `internal:${randomUUID()}`, internal: true, params: {meta: {chat_id: owner, source: 'dashboard'}, content: text}}, true)
+          recoveryStore.prepareChannel({key: `owner:${randomUUID()}`, internal: false, params: {meta: {chat_id: owner, source: 'dashboard'}, content: text}}, true)
           socket.end(JSON.stringify({ok: true}) + '\n')
           void drain()
         } catch (error) { socket.end(JSON.stringify({ok: false, error: error.message}) + '\n') }

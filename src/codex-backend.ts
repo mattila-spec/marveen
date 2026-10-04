@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { connect } from 'node:net'
 import { spawn } from 'node:child_process'
 import { PROJECT_ROOT, STORE_DIR } from './config.js'
-import { getCodexDeliveryStore, type CodexDelivery, type CodexDeliveryStore } from './codex-delivery.js'
+import { getCodexDeliveryStore, scheduledCodexIdentity, type CodexDelivery, type CodexDeliveryStore } from './codex-delivery.js'
 
 export function usesCodex(): boolean {
   return process.env.MARVEEN_AGENT_BACKEND === 'codex'
@@ -47,6 +47,33 @@ export function sendCodexPrompt(text: string): Promise<void> {
         const result = JSON.parse(data.split('\n')[0])
         if (result.ok) resolve()
         else reject(new Error(result.error || 'Codex rejected prompt'))
+      } catch (error) { reject(error) }
+    })
+  })
+}
+
+export function sendCodexScheduledDelivery(input: {
+  taskId: string; agentId: string; scheduledOccurrence: number; prompt: string; queuedAt: number; late: boolean
+}): Promise<{ deliveryId: string; idempotencyKey: string; scheduledOccurrence: number; status: string; created: boolean }> {
+  const identity = scheduledCodexIdentity(input.taskId, input.agentId, input.scheduledOccurrence)
+  const payload = { type: 'scheduled_delivery', ...input, ...identity }
+  return new Promise((resolve, reject) => {
+    const socket = connect(join(STORE_DIR, 'codex/channel.sock'))
+    let data = ''
+    socket.setTimeout(5000, () => socket.destroy(new Error('Codex channel unavailable')))
+    socket.on('error', reject)
+    socket.on('connect', () => socket.write(JSON.stringify(payload) + '\n'))
+    socket.on('data', chunk => {
+      data += chunk
+      if (!data.includes('\n')) return
+      socket.end()
+      try {
+        const result = JSON.parse(data.split('\n')[0])
+        if (!result.ok) throw new Error(result.error || 'Codex rejected scheduled delivery')
+        if (result.deliveryId !== identity.deliveryId || result.idempotencyKey !== identity.idempotencyKey ||
+            result.scheduledOccurrence !== input.scheduledOccurrence) throw new Error('Codex delivery acknowledgement mismatch')
+        resolve({ deliveryId: result.deliveryId, idempotencyKey: result.idempotencyKey,
+          scheduledOccurrence: result.scheduledOccurrence, status: result.status, created: result.created })
       } catch (error) { reject(error) }
     })
   })
