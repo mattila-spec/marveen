@@ -38,14 +38,19 @@ let deliveryStore
 let ownerChatId
 let activeTools = 0
 let rotationBusy = false
+let lastStatusSignature = ''
 
 function persist(snapshot = state) {
   writeAtomicJson(stateFile, snapshot)
 }
 function status() {
-  writeAtomicJson(join(store, 'status.json'), {pid: process.pid,
+  const snapshot = {pid: process.pid,
     busy: lanes.some(l => l.processing) || activeTools > 0, foregroundBusy: lanes[0].processing,
-    backgroundBusy: lanes[1].processing, rotationBusy, activeTools, model: DEFAULT_MODEL, strongerModel: 'gpt-6-sol'})
+    backgroundBusy: lanes[1].processing, rotationBusy, activeTools, model: DEFAULT_MODEL, strongerModel: 'gpt-6-sol'}
+  const signature = JSON.stringify(snapshot)
+  if (signature === lastStatusSignature) return
+  writeAtomicJson(join(store, 'status.json'), snapshot)
+  lastStatusSignature = signature
 }
 function peer(command, args, env = process.env, fatal = true) {
   const rpc = new JsonRpcProcess(command, args, { cwd: root, env, detached: process.platform !== 'win32' })
