@@ -425,7 +425,7 @@ function checkInboundProbeDeafness(probeTimeoutMs: number): void {
 
     // hardRestartMarveenChannels sets marveenLastHardRestart on success, which
     // automatically suppresses the keepalive path for KEEPALIVE_RESPAWN_GRACE_MS.
-    const result = hardRestartMarveenChannels()
+    const result = hardRestartMarveenChannels({ automatic: true, actor: 'inbound-probe' })
     if (result.ok) {
       lastInboundRespawn = nowAfterImport
       logger.warn('Inbound deafness respawn triggered successfully')

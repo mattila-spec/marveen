@@ -18,6 +18,7 @@ import { createAgentMessage, hasOpenInboundQuestion } from '../db.js'
 import { readContextGuardConfig } from './context-guard-store.js'
 import { getHardGuardPhase } from './context-guard-runner.js'
 import { dailyHandoffArmed } from '../context-guard.js'
+import { claimMainRecovery, failMainRecovery, watchMainRecovery } from './self-healing-recovery-gate.js'
 
 // Drives per-agent scheduled restarts (see src/auto-restart.ts for the why and
 // the pure due-logic). Mirrors the other watcher loops: a 60s sweep, started
@@ -91,10 +92,19 @@ function paneIsIdle(session: string, host: string | null): boolean {
 // auto-restart as enabled and correctly scheduled.
 function restartMainChannelsSession(): void {
   if (mainRestartMechanism(existsSync('/bin/launchctl')) === 'launchd') {
+    const actor = 'scheduled-restart-launchd'
+    const attempt = claimMainRecovery(actor)
+    if (!attempt) throw new Error('shared recovery gate denied scheduled main restart')
     const uid = typeof process.getuid === 'function' ? process.getuid() : ''
     // Label keys off SERVICE_ID (defaults to MAIN_AGENT_ID) so it matches the
     // launchd label the installer wrote. KeepAlive brings it straight back.
-    execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${SERVICE_ID}.channels`], { timeout: 10_000 })
+    try {
+      execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${SERVICE_ID}.channels`], { timeout: 10_000 })
+      watchMainRecovery(actor, attempt)
+    } catch (err) {
+      failMainRecovery(actor, attempt, String(err))
+      throw err
+    }
     return
   }
   // Linux (and any host without launchd): reuse the SAME respawn path the

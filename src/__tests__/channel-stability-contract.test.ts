@@ -119,8 +119,8 @@ describe('P2#5 — dashboard restart routes the main agent through respawn-pane 
   })
   it('hardRestartMarveenChannels never systemctl-restarts and isolates Codex to its pane', () => {
     const cm = stripTsComments(read('src/web/channel-monitor.ts'))
-    const start = cm.indexOf('export function hardRestartMarveenChannels')
-    const end = cm.indexOf('\nfunction maybeRestartWedgedMainChannel', start)
+    const start = cm.indexOf('function hardRestartMarveenChannelsRaw')
+    const end = cm.indexOf('\nexport function hardRestartMarveenChannels', start)
     expect(start).toBeGreaterThan(-1)
     expect(end).toBeGreaterThan(start)
     const restartFn = cm.slice(start, end)

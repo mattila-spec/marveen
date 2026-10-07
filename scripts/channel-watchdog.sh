@@ -61,6 +61,11 @@ AUTH_DEAD_THRESHOLD_TICKS=3     # consecutive dead-token ticks (~15min @ 5min/ti
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$LOG_TAG] $*"; }
 
+# Cross-process incident budget shared with channels.sh, the systemd unit and
+# in-process recovery actors. A local respawn count is not a safety boundary.
+GATE="$INSTALL_DIR/scripts/self-healing-attempt-gate.py"
+INCIDENT="main-channels"
+
 # --- resolve the channels session + provider (launch-order / rename independent) ---
 MAIN_AGENT_ID="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
 MAIN_AGENT_ID="${MAIN_AGENT_ID:-marveen}"
@@ -165,6 +170,18 @@ if [ "$count" -ge "$MAX_CONSECUTIVE" ]; then
   exit 0
 fi
 
+gate_out="$(python3 "$GATE" claim "$INCIDENT" channel-watchdog 2>&1)"
+gate_rc=$?
+if [ "$gate_rc" -ne 0 ]; then
+  log "STOP: shared recovery gate denied attempt: $gate_out"
+  exit 0
+fi
+attempt_id="$(printf '%s' "$gate_out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["attempt_id"])' 2>/dev/null)"
+if [ -z "$attempt_id" ]; then
+  log "STOP: shared recovery gate returned no attempt token"
+  exit 0
+fi
+
 # --- recover: respawn-pane ONLY the channels session, fresh claude ---
 # RESPAWNMODEL807: this used to read ONLY .claude/settings.json with jq -- a
 # second copy of the model resolution that missed BOTH the .env override (the
@@ -257,7 +274,9 @@ if "$TMUX_BIN" respawn-pane -k -t "$SESSION" "$RESPAWN_CMD" 2>/dev/null; then
   echo $(( count + 1 )) > "$RESPAWN_COUNT_FILE"
   rm -f "$AUTH_DEAD_COUNT_FILE" 2>/dev/null || true
   log "respawn-pane issued"
+  nohup python3 "$GATE" watch "$INCIDENT" "$attempt_id" "$SESSION" >>"$STORE/self-healing-gate.log" 2>&1 </dev/null &
 else
   log "respawn-pane FAILED for $SESSION"
+  python3 "$GATE" fail "$INCIDENT" "$attempt_id" "channel-watchdog respawn-pane failed" >/dev/null 2>&1 || true
 fi
 exit 0

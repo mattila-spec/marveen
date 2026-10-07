@@ -61,6 +61,10 @@ _guard_sender() {
   printf '%s' "${MAIN_AGENT_ID:-marveen}"
 }
 
+SELF_HEALING_GATE="$INSTALL_DIR/scripts/self-healing-attempt-gate.py"
+SELF_HEALING_INCIDENT="main-channels"
+SELF_HEALING_ACTOR="channels-launcher"
+SELF_HEALING_ATTEMPT_ID=""
 # Read MAIN_AGENT_ID and CHANNEL_PROVIDER from .env WITHOUT exporting
 # every variable into the shell environment. `set -a && source .env`
 # would also export TELEGRAM_BOT_TOKEN, which then leaks into the tmux
@@ -361,6 +365,49 @@ if [ "${1:-}" = "--classify-mcp-pane" ]; then
   classify_mcp_plugin_row "$(cat)"
   echo "$MCP_PLUGIN_STATE"
   exit 0
+fi
+
+# All pure resolver/classifier modes above are read-only. Runtime startup is
+# claimed here so launchd, systemd, the shell watchdog and in-process actors all
+# enter the same persistent main-channel incident budget.
+_main_agent_for_gate="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+_main_agent_for_gate="${_main_agent_for_gate:-marveen}"
+_main_session_for_gate="${_main_agent_for_gate}-channels"
+_gate_owned_by_parent=0
+if [ "${MARVEEN_SELF_HEALING_GATE_MANAGED:-}" = "systemd-supervisor" ]; then
+  _gate_state="$(python3 "$SELF_HEALING_GATE" status "$SELF_HEALING_INCIDENT" 2>&1)"
+  SELF_HEALING_ATTEMPT_ID="$(printf '%s' "$_gate_state" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=d.get("active") or {}; print(a.get("id","") if a.get("actor")=="systemd-supervisor" else "")' 2>/dev/null)"
+  if [ -z "$SELF_HEALING_ATTEMPT_ID" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: systemd recovery gate missing; refusing uncounted start" >> "$INSTALL_DIR/store/channels-failures.log"
+    exit 73
+  fi
+elif [ -n "${MARVEEN_SELF_HEALING_ATTEMPT_ID:-}" ]; then
+  _gate_state="$(python3 "$SELF_HEALING_GATE" status "$SELF_HEALING_INCIDENT" 2>&1)"
+  SELF_HEALING_ATTEMPT_ID="$(printf '%s' "$_gate_state" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=d.get("active") or {}; expected=sys.argv[1]; print(a.get("id","") if a.get("id")==expected else "")' "$MARVEEN_SELF_HEALING_ATTEMPT_ID" 2>/dev/null)"
+  if [ -z "$SELF_HEALING_ATTEMPT_ID" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: parent recovery attempt is not active; refusing uncounted start" >> "$INSTALL_DIR/store/channels-failures.log"
+    exit 73
+  fi
+  _gate_owned_by_parent=1
+else
+  _gate_claim="$(python3 "$SELF_HEALING_GATE" claim "$SELF_HEALING_INCIDENT" "$SELF_HEALING_ACTOR" 2>&1)"
+  if [ "$?" -ne 0 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: automatic start blocked by shared recovery gate: $_gate_claim" >> "$INSTALL_DIR/store/channels-failures.log"
+    exit 73
+  fi
+  SELF_HEALING_ATTEMPT_ID="$(printf '%s' "$_gate_claim" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("attempt_id", ""))' 2>/dev/null)"
+  if [ -z "$SELF_HEALING_ATTEMPT_ID" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: recovery gate returned no attempt id; refusing start" >> "$INSTALL_DIR/store/channels-failures.log"
+    exit 73
+  fi
+  trap 'python3 "$SELF_HEALING_GATE" fail "$SELF_HEALING_INCIDENT" "$SELF_HEALING_ATTEMPT_ID" "channels.sh exited before verified recovery" >/dev/null 2>&1 || true' EXIT
+fi
+
+if [ "${MARVEEN_AGENT_BACKEND:-}" = "codex" ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
+  if [ "${MARVEEN_SELF_HEALING_GATE_MANAGED:-}" != "systemd-supervisor" ] && [ "$_gate_owned_by_parent" -eq 0 ]; then
+    nohup python3 "$SELF_HEALING_GATE" watch "$SELF_HEALING_INCIDENT" "$SELF_HEALING_ATTEMPT_ID" "$_main_session_for_gate" >> "$INSTALL_DIR/store/channels-failures.log" 2>&1 </dev/null &
+  fi
+  exec /bin/bash "$INSTALL_DIR/scripts/codex-channels.sh"
 fi
 
 # --- input-line probe for the /mcp unlock (MCPDUP806) -------------------------
@@ -1371,6 +1418,9 @@ _tmux_set_auth_globals
 # this is the defense-in-depth layer, not the only fix.)
 $TMUX set-option -t "$SESSION" remain-on-exit on 2>/dev/null || true
 $TMUX set-environment -g -u "$STATE_ENV_VAR" 2>/dev/null || true
+if [ "${MARVEEN_SELF_HEALING_GATE_MANAGED:-}" != "systemd-supervisor" ] && [ "$_gate_owned_by_parent" -eq 0 ]; then
+  nohup python3 "$SELF_HEALING_GATE" watch "$SELF_HEALING_INCIDENT" "$SELF_HEALING_ATTEMPT_ID" "$SESSION" >> "$INSTALL_DIR/store/channels-failures.log" 2>&1 </dev/null &
+fi
 
 # Session startup guard: a Claude Code first-run dialogusait auto-accept-eljuk
 # kulonben a headless session orokre parkolna a prompton es a Telegram plugin

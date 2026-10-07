@@ -112,7 +112,11 @@ describe('C4 approval policy', () => {
     const bridge = readFileSync(join(process.cwd(), 'scripts/codex-channels.mjs'), 'utf8')
     const runner = readFileSync(join(process.cwd(), 'src/web/schedule-runner.ts'), 'utf8')
     expect(bridge).toMatch(/\.\.\.channelApprovalSettings\(\{ internal \}\)/)
-    expect(bridge).toMatch(/createFreshThread[\s\S]*?\.\.\.channelApprovalSettings\(\{internal: false\}\)/)
+    // Automatic foreground rotation is deliberately not wired into the live
+    // bridge: the C5 implementation caused unbounded memory growth in
+    // production. Owner turns still receive the explicit on-request approval
+    // policy above, while rotation remains a separately tested helper.
+    expect(bridge).not.toMatch(/createFreshThread/)
     expect(bridge).toMatch(/acceptScheduledDelivery\(deliveryStore, request\)/)
     expect(bridge).toMatch(/internal: false, params: \{meta: \{chat_id: owner/)
     expect(runner).toMatch(/sendCodexScheduledDelivery\(/)

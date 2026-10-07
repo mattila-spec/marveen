@@ -61,6 +61,7 @@ STUCK_SECONDS="${STUCK_MODAL_SECONDS:-120}"   # must stay stuck this long before
 case "$STUCK_SECONDS" in (''|*[!0-9]*) STUCK_SECONDS=120;; esac
 GRACE_SECONDS=$(( 15 * 60 ))                   # shared respawn grace (matches watchdog)
 MAX_CONSECUTIVE=3                              # respawns before backoff+alert
+SELF_HEALING_GATE="$INSTALL_DIR/scripts/self-healing-attempt-gate.py"
 MAX_ESCAPES=4                                  # ensure_modal_closed bound
 # Respawn target plugin: config-overridable so a non-default install (renamed or
 # locally-built plugin) is never respawned with a WRONG plugin id -- a mismatch
@@ -215,19 +216,38 @@ run_guard() {
       log "STUCK modal confirmed ($(( now - firstseen ))s) -> Escape (max ${MAX_ESCAPES}x)" ;;
   esac
 
+  gate_out="$(python3 "$SELF_HEALING_GATE" claim main-channels stuck-modal-guard 2>&1)"
+  if [ "$?" -ne 0 ]; then
+    log "STOP: shared recovery gate denied attempt: $gate_out"
+    return 0
+  fi
+  attempt_id="$(printf '%s' "$gate_out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("attempt_id", ""))' 2>/dev/null)"
+  if [ -z "$attempt_id" ]; then
+    log "STOP: shared recovery gate returned no attempt token"
+    return 0
+  fi
+
   # --- recovery: Escape (bounded), like ensure_modal_closed --------------------
   local i p
   for i in $(seq 1 "$MAX_ESCAPES"); do
     p="$("$TMUX_BIN" capture-pane -t "$SESSION" -p 2>/dev/null || true)"
     case "$(printf '%s' "$p" | classify_pane)" in
-      idle|busy) log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
+      idle|busy)
+        log "modal closed via Escape -- session healthy"
+        python3 "$SELF_HEALING_GATE" resolve main-channels "$attempt_id" "stuck-modal-guard Escape restored idle or busy pane" >/dev/null 2>&1 || true
+        rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true
+        return 0 ;;
     esac
     "$TMUX_BIN" send-keys -t "$SESSION" Escape 2>/dev/null || true
     sleep 0.5
   done
   p="$("$TMUX_BIN" capture-pane -t "$SESSION" -p 2>/dev/null || true)"
   case "$(printf '%s' "$p" | classify_pane)" in
-    idle|busy) log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
+    idle|busy)
+      log "modal closed via Escape -- session healthy"
+      python3 "$SELF_HEALING_GATE" resolve main-channels "$attempt_id" "stuck-modal-guard Escape restored idle or busy pane" >/dev/null 2>&1 || true
+      rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true
+      return 0 ;;
   esac
 
   # --- still stuck: respawn-pane (cross-watchdog coordination via grace stamp) --
@@ -345,9 +365,11 @@ run_guard() {
     echo $(( count + 1 )) > "$RESPAWN_COUNT_FILE" 2>/dev/null || true
     rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true
     log "respawn-pane issued"
+    nohup python3 "$SELF_HEALING_GATE" watch main-channels "$attempt_id" "$SESSION" >>"$STORE/self-healing-gate.log" 2>&1 </dev/null &
     alert_owner "⚠️ The ${SESSION} session was stuck in a /mcp modal -- auto-respawn #$((count+1)) issued. If you messaged during the outage and got no reply, please resend."
   else
     log "respawn-pane FAILED (or claude not on PATH) for $SESSION"
+    python3 "$SELF_HEALING_GATE" fail main-channels "$attempt_id" "stuck-modal-guard respawn-pane failed or claude unavailable" >/dev/null 2>&1 || true
   fi
   return 0
 }

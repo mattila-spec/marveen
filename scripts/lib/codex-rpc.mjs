@@ -78,7 +78,7 @@ export function channelInput(params) {
 }
 
 export function isContextExhausted(error) {
-  return /ran out of room in the model.s context window|context window exceeded|context_length_exceeded|Error running remote compact task:.*Bad Request/i.test(String(error?.message ?? error))
+  return /ran out of room in the model.s context window|context window exceeded|context_length_exceeded|Error running remote compact task:.*Bad Request|no rollout found for thread id/i.test(String(error?.message ?? error))
 }
 
 export function retireExhaustedThread(state, chatId, error) {

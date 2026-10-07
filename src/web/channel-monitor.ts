@@ -72,6 +72,7 @@ import { getClaudePidForSession, hasChannelPluginAlive, probeChannelPluginLivene
 import { getDesiredAgents } from './agent-desired-state.js'
 import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
 import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
+import { claimMainRecovery, failMainRecovery, watchMainRecovery } from './self-healing-recovery-gate.js'
 
 // Lazily resolved (see makeLazyBinResolver): a module-level `resolveFromPath`
 // const throws at IMPORT time, so any environment where the binary is not
@@ -754,7 +755,18 @@ function getMainAgentProvider(): ChannelProviderType {
 }
 
 function softReconnectMarveen(): boolean {
-  return attemptChannelMcpReconnect(MAIN_AGENT_ID).ok
+  const actor = 'channel-mcp-soft-reconnect'
+  const attempt = claimMainRecovery(actor)
+  if (!attempt) return false
+  try {
+    const result = attemptChannelMcpReconnect(MAIN_AGENT_ID)
+    if (result.ok) watchMainRecovery(actor, attempt)
+    else failMainRecovery(actor, attempt, result.message || 'MCP reconnect action was not accepted')
+    return result.ok
+  } catch (err) {
+    failMainRecovery(actor, attempt, String(err))
+    return false
+  }
 }
 
 async function triggerMarveenMemorySave(): Promise<void> {
@@ -988,7 +1000,7 @@ export function mainChannelStateEnv(provider: ChannelProviderType): { name: stri
 // of it applies to a fresh start. What IS shared -- the two reaps, the onboarding
 // re-seed, the respawn command builder, the identity + plugin-unlock follow-ups --
 // is called here too, so the two paths cannot drift on the parts that matter.
-export function respawnMainSessionFresh(): void {
+function respawnMainSessionFreshRaw(): void {
   const provider = getProvider(getMainAgentProvider())
   // Same rationale as the resume path: respawn-pane -k kills the parent claude
   // but leaves grandchild pollers alive, and two pollers on one bot token race
@@ -1059,6 +1071,19 @@ export function respawnMainSessionFresh(): void {
   schedulePluginUnlockAfterRespawn(MAIN_CHANNELS_SESSION, provider.type)
 }
 
+export function respawnMainSessionFresh(): void {
+  const actor = 'scheduled-restart'
+  const attempt = claimMainRecovery(actor)
+  if (!attempt) throw new Error('shared recovery gate denied scheduled main restart')
+  try {
+    respawnMainSessionFreshRaw()
+    watchMainRecovery(actor, attempt)
+  } catch (err) {
+    failMainRecovery(actor, attempt, String(err))
+    throw err
+  }
+}
+
 // Exported so the stuck-tool-call-watcher recovers a wedged main session via
 // this respawn-pane path (reap + `tmux respawn-pane -k --continue`) INSTEAD of
 // the launchctl hard-restart. respawn-pane replaces only the claude process in
@@ -1066,7 +1091,7 @@ export function respawnMainSessionFresh(): void {
 // kicked ([exited]) -- the #248 user-visible crash. It also runs the
 // pane-attribution detached-claude reap first, breaking the orphan->409->freeze
 // doom-loop that the launchctl path (channels.sh env-grep reap) never cleaned.
-export async function resumeMarveenSession(): Promise<boolean> {
+async function resumeMarveenSessionRaw(): Promise<boolean> {
   const provider = getProvider(getMainAgentProvider())
   try {
     // Reap any orphan bun/node poller BEFORE we respawn. tmux respawn-pane -k
@@ -1171,6 +1196,21 @@ export async function resumeMarveenSession(): Promise<boolean> {
   } catch (err) {
     logger.error({ err }, 'Marveen session respawn failed')
     return false
+  }
+}
+
+export async function resumeMarveenSession(): Promise<boolean> {
+  const actor = 'channel-down-cascade-resume'
+  const attempt = claimMainRecovery(actor)
+  if (!attempt) return false
+  try {
+    const ok = await resumeMarveenSessionRaw()
+    if (ok) watchMainRecovery(actor, attempt)
+    else failMainRecovery(actor, attempt, 'resume path returned false')
+    return ok
+  } catch (err) {
+    failMainRecovery(actor, attempt, String(err))
+    throw err
   }
 }
 
@@ -1315,7 +1355,7 @@ export function mainChannelsSessionExists(): boolean {
 // collapsed both into a silent false success (PR #779 review).
 export type MainSessionCreateResult = 'started' | 'grace' | 'script-missing' | 'spawn-failed'
 
-export function createMainChannelsSession(): MainSessionCreateResult {
+export function createMainChannelsSession(attemptId?: string): MainSessionCreateResult {
   const now = Date.now()
   if (marveenLastSessionCreate && now - marveenLastSessionCreate < MAIN_SESSION_CREATE_GRACE_MS) {
     return 'grace'
@@ -1333,6 +1373,9 @@ export function createMainChannelsSession(): MainSessionCreateResult {
       detached: true,
       stdio: 'ignore',
       cwd: PROJECT_ROOT,
+      env: attemptId
+        ? { ...process.env, MARVEEN_SELF_HEALING_ATTEMPT_ID: attemptId }
+        : process.env,
     })
     child.unref()
     marveenLastSessionCreate = now
@@ -1353,7 +1396,7 @@ export function createMainChannelsSession(): MainSessionCreateResult {
 // but starts a clean session -- exactly what scripts/channels.sh does -- so a
 // wedged plugin gets a brand-new process even on pure-tmux installs. Distinct
 // from the stage-3 resume (which keeps --continue) by clearing session state.
-function respawnMarveenSessionFresh(): boolean {
+function respawnMarveenSessionFreshRaw(attemptId?: string): boolean {
   const provider = getProvider(getMainAgentProvider())
   try {
     // Same first-run-picker guard as resumeMarveenSession.
@@ -1399,10 +1442,25 @@ function respawnMarveenSessionFresh(): boolean {
         { session: MAIN_CHANNELS_SESSION },
         'Fresh respawn: pane gone -- falling back to full session recreate (channels.sh)',
       )
-      const result = createMainChannelsSession()
+      const result = createMainChannelsSession(attemptId)
       return result === 'started' || result === 'grace'
     }
     logger.error({ err }, 'Fresh session respawn failed')
+    return false
+  }
+}
+
+function respawnMarveenSessionFresh(): boolean {
+  const actor = 'channel-monitor-fresh-respawn'
+  const attempt = claimMainRecovery(actor)
+  if (!attempt) return false
+  try {
+    const ok = respawnMarveenSessionFreshRaw(attempt)
+    if (ok) watchMainRecovery(actor, attempt)
+    else failMainRecovery(actor, attempt, 'fresh respawn returned false')
+    return ok
+  } catch (err) {
+    failMainRecovery(actor, attempt, String(err))
     return false
   }
 }
@@ -1500,7 +1558,7 @@ function mainPaneClaudePid(): number | null {
   }
 }
 
-export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
+function hardRestartMarveenChannelsRaw(attemptId?: string): { ok: boolean; error?: string } {
   if (process.env.MARVEEN_AGENT_BACKEND === 'codex') {
     // The channels unit and every agent may share one tmux server. Restarting
     // the systemd unit can therefore terminate unrelated agent sessions.
@@ -1570,11 +1628,27 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
   // tmux server and with it EVERY agent session, not just the main one.
   // respawn-pane replaces only the claude process in the main channels pane,
   // leaving the server and all other sessions intact.
-  if (respawnMarveenSessionFresh()) {
+  if (respawnMarveenSessionFreshRaw(attemptId)) {
     marveenLastHardRestart = Date.now()
     return { ok: true }
   }
   return { ok: false, error: 'hard restart failed: tmux respawn-pane failed' }
+}
+
+export function hardRestartMarveenChannels(options: { automatic?: boolean; actor?: string } = {}): { ok: boolean; error?: string } {
+  if (!options.automatic) return hardRestartMarveenChannelsRaw()
+  const actor = options.actor ?? 'channel-monitor-hard-restart'
+  const attempt = claimMainRecovery(actor)
+  if (!attempt) return { ok: false, error: 'shared recovery gate denied automatic recovery; STOP and escalate' }
+  try {
+    const result = hardRestartMarveenChannelsRaw(attempt)
+    if (result.ok) watchMainRecovery(actor, attempt)
+    else failMainRecovery(actor, attempt, result.error ?? 'hard restart failed')
+    return result
+  } catch (err) {
+    failMainRecovery(actor, attempt, String(err))
+    return { ok: false, error: String(err) }
+  }
 }
 
 // Escalate a main channel input that survived the full soft recovery to a hard
@@ -1633,7 +1707,7 @@ function maybeRestartWedgedMainChannel(state: StuckInputState): void {
     return
   }
   logger.warn({ session: MAIN_CHANNELS_SESSION, attempts: state.attempts, restart: stuckRestartCount + 1 }, 'Stuck main channel input survived soft recovery -- escalating to hard restart (respawn-pane)')
-  const r = hardRestartMarveenChannels()
+  const r = hardRestartMarveenChannels({ automatic: true, actor: 'stuck-input-watchdog' })
   lastStuckRestartAt = Date.now()
   if (r.ok) {
     stuckRestartCount++
@@ -2073,7 +2147,7 @@ async function handleMarveenDown(): Promise<void> {
     logger.warn({ provider: providerLabel }, 'Marveen channel plugin still down -- stage 4 (hard restart)')
     const svcName = process.platform === 'linux' ? 'systemctl' : 'launchctl'
     sendAlert(`⚠️ Session resume nem segitett. Hard restart (${svcName}) most a ${MAIN_CHANNELS_SESSION} session-on...`)
-    hardRestartMarveenChannels()
+    hardRestartMarveenChannels({ automatic: true, actor: 'channel-down-cascade' })
     return
   }
   if (marveenDownState.stage === 'hard') {
