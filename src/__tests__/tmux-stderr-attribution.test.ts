@@ -75,7 +75,7 @@ describe('tmux stderr attribution (TMUXWINDOWATTR920)', () => {
   // ---- (c) the whole of src/web ---------------------------------------------
   // What still leaks today, named. Each entry: file (relative to src/web),
   // subcommand, the exact number of leaky calls, and why it is allowed to stay
-  // for now. Measured on the PR head 2026-09-20 with the scan below: 31 calls
+  // for now. Measured on the integrated recovery head with the scan below: 32 calls
   // in 6 files, 24 of them send-keys. (An async execFile in reauth-healer.ts
   // is NOT here: async execFile pipes by default and does not leak.)
   //
@@ -90,7 +90,7 @@ describe('tmux stderr attribution (TMUXWINDOWATTR920)', () => {
     { file: 'agent-worker.ts', sub: 'send-keys', count: 3, why: 'worker start/restart key injection; a missing worker session is caught by the caller' },
     { file: 'channel-mcp-reconnect.ts', sub: 'send-keys', count: 8, why: '/mcp reconnect keystrokes into the main pane; the caller reads the pane afterwards' },
     { file: 'channel-monitor.ts', sub: 'send-keys', count: 3, why: 'Enter/Escape nudges into a pane the monitor has just measured as present' },
-    { file: 'channel-monitor.ts', sub: 'respawn-pane', count: 3, why: 'respawn-pane -k is the hard-restart action itself; its failure is reported by the caller' },
+    { file: 'channel-monitor.ts', sub: 'respawn-pane', count: 4, why: 'respawn-pane -k is the hard-restart action itself; its failure is reported by the caller' },
     { file: 'channel-plugin-unlock.ts', sub: 'send-keys', count: 8, why: 'consent-dialog keystrokes; the caller captures the pane between steps' },
     { file: 'channel-plugin-unlock.ts', sub: 'capture-pane', count: 2, why: 'pane capture around the keystrokes above; failure returns null to the caller' },
     { file: 'context-restart-gate-runner.ts', sub: 'send-keys', count: 2, why: '/clear + Enter into a gated session the runner has just verified' },
@@ -171,7 +171,7 @@ describe('tmux stderr attribution (TMUXWINDOWATTR920)', () => {
     // and a leak fixed WITHOUT updating the list fails too (count down) -- the
     // list is the debt ledger and must stay true.
     expect(measured).toEqual(allowed)
-    expect(allowed.reduce((n, e) => n + e.count, 0)).toBe(31)
+    expect(allowed.reduce((n, e) => n + e.count, 0)).toBe(32)
   })
 
   it('the converted sites are NOT in the leak scan (positive control on the real tree)', () => {

@@ -30,9 +30,9 @@ describe('hardRestartMarveenChannels: launchd reload is verified by effect, not 
     })
   })
 
-  const fnStart = src.indexOf('export function hardRestartMarveenChannels')
-  expect(fnStart, 'hardRestartMarveenChannels not found').toBeGreaterThan(0)
-  const fnEnd = src.indexOf('\n// Escalate a main channel input', fnStart)
+  const fnStart = src.indexOf('function hardRestartMarveenChannelsRaw')
+  expect(fnStart, 'hardRestartMarveenChannelsRaw not found').toBeGreaterThan(0)
+  const fnEnd = src.indexOf('\nexport function hardRestartMarveenChannels', fnStart)
   const fnBody = src.slice(fnStart, fnEnd > fnStart ? fnEnd : undefined)
 
   it('reads the pane pid BEFORE the launchctl calls', () => {
@@ -54,7 +54,7 @@ describe('hardRestartMarveenChannels: launchd reload is verified by effect, not 
     // No `return` between the failed effect check and the respawn-pane call:
     // the whole point is that a no-effect reload must not end the function.
     const noEffectIdx = fnBody.indexOf('falling through to respawn-pane')
-    const respawnIdx = fnBody.indexOf('respawnMarveenSessionFresh()')
+    const respawnIdx = fnBody.indexOf('respawnMarveenSessionFreshRaw(attemptId)')
     expect(noEffectIdx, 'no-effect log line missing').toBeGreaterThan(0)
     expect(respawnIdx).toBeGreaterThan(noEffectIdx)
     expect(fnBody.slice(noEffectIdx, respawnIdx)).not.toMatch(/return \{ ok: true \}/)

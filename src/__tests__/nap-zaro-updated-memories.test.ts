@@ -69,9 +69,9 @@ describe('nap-zaro SKILL.md step-2: uj + frissitett emlekek (NAPZAROFRISS918)', 
       }
     })
     // the shipped script connects to "localhost", which this environment resolves to
-    // ::1 first (IPv6) -- bind there explicitly instead of 127.0.0.1, or the python
-    // process tries the wrong address family first.
-    await new Promise<void>((resolve) => server.listen(0, '::1', resolve))
+    // either IPv6 or IPv4 depending on host policy. A dual-stack listener keeps
+    // the test independent of that resolver ordering.
+    await new Promise<void>((resolve) => server.listen({ port: 0, host: '::', ipv6Only: false }, resolve))
     port = (server.address() as { port: number }).port
   })
 

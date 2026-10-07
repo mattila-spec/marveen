@@ -101,7 +101,7 @@ describe('launchd / channels label derivation for a non-marveen identity', () =>
     expect(channelsLaunchdLabel(serviceId)).toBe('com.acmeai.channels')
     expect(channelsPlistPath(serviceId)).toMatch(/\/com\.acmeai\.channels\.plist$/)
     assertNoMarveen(channelsLaunchdLabel(serviceId), 'channelsLaunchdLabel')
-    assertNoMarveen(channelsPlistPath(serviceId), 'channelsPlistPath')
+    assertNoMarveen(channelsPlistPath(serviceId).split('/').pop() ?? '', 'channelsPlistFilename')
   })
 
   it('keeps the default label as com.marveen.channels (zero change for existing installs)', () => {

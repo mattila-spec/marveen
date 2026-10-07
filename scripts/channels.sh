@@ -18,8 +18,20 @@
 # Kézzel rácsatlakozás: tmux attach -t <MAIN_AGENT_ID>-channels (pl. marveen-channels)
 
 INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-if [ "${MARVEEN_AGENT_BACKEND:-}" = "codex" ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
-  exec /bin/bash "$INSTALL_DIR/scripts/codex-channels.sh"
+# Pure diagnostic/test seams must never claim the shared recovery budget or
+# dispatch to the Codex runtime. They are read-only helpers, not channel starts.
+case "${1:-}" in
+  --pane-dead-check|--bot-owner-check|--classify-mcp-pane|--probe-input-state|--classify-unlock-residue|"--exit-"probe)
+    _channels_skip_recovery_gate=1
+    ;;
+  *)
+    _channels_skip_recovery_gate=0
+    ;;
+esac
+if [ "$_channels_skip_recovery_gate" -eq 0 ]; then
+  if [ "${MARVEEN_AGENT_BACKEND:-}" = "codex" ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
+    exec /bin/bash "$INSTALL_DIR/scripts/codex-channels.sh"
+  fi
 fi
 
 # WHO THE GUARD ALERTS IN THIS SCRIPT ARE SENT AS.
@@ -374,7 +386,9 @@ _main_agent_for_gate="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" 2>/dev/nul
 _main_agent_for_gate="${_main_agent_for_gate:-marveen}"
 _main_session_for_gate="${_main_agent_for_gate}-channels"
 _gate_owned_by_parent=0
-if [ "${MARVEEN_SELF_HEALING_GATE_MANAGED:-}" = "systemd-supervisor" ]; then
+if [ "$_channels_skip_recovery_gate" -eq 1 ]; then
+  :
+elif [ "${MARVEEN_SELF_HEALING_GATE_MANAGED:-}" = "systemd-supervisor" ]; then
   _gate_state="$(python3 "$SELF_HEALING_GATE" status "$SELF_HEALING_INCIDENT" 2>&1)"
   SELF_HEALING_ATTEMPT_ID="$(printf '%s' "$_gate_state" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=d.get("active") or {}; print(a.get("id","") if a.get("actor")=="systemd-supervisor" else "")' 2>/dev/null)"
   if [ -z "$SELF_HEALING_ATTEMPT_ID" ]; then
@@ -403,11 +417,13 @@ else
   trap 'python3 "$SELF_HEALING_GATE" fail "$SELF_HEALING_INCIDENT" "$SELF_HEALING_ATTEMPT_ID" "channels.sh exited before verified recovery" >/dev/null 2>&1 || true' EXIT
 fi
 
-if [ "${MARVEEN_AGENT_BACKEND:-}" = "codex" ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
-  if [ "${MARVEEN_SELF_HEALING_GATE_MANAGED:-}" != "systemd-supervisor" ] && [ "$_gate_owned_by_parent" -eq 0 ]; then
-    nohup python3 "$SELF_HEALING_GATE" watch "$SELF_HEALING_INCIDENT" "$SELF_HEALING_ATTEMPT_ID" "$_main_session_for_gate" >> "$INSTALL_DIR/store/channels-failures.log" 2>&1 </dev/null &
+if [ "$_channels_skip_recovery_gate" -eq 0 ]; then
+  if [ "${MARVEEN_AGENT_BACKEND:-}" = "codex" ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
+    if [ "${MARVEEN_SELF_HEALING_GATE_MANAGED:-}" != "systemd-supervisor" ] && [ "$_gate_owned_by_parent" -eq 0 ]; then
+      nohup python3 "$SELF_HEALING_GATE" watch "$SELF_HEALING_INCIDENT" "$SELF_HEALING_ATTEMPT_ID" "$_main_session_for_gate" >> "$INSTALL_DIR/store/channels-failures.log" 2>&1 </dev/null &
+    fi
+    exec /bin/bash "$INSTALL_DIR/scripts/codex-channels.sh"
   fi
-  exec /bin/bash "$INSTALL_DIR/scripts/codex-channels.sh"
 fi
 
 # --- input-line probe for the /mcp unlock (MCPDUP806) -------------------------

@@ -22,37 +22,37 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const src = readFileSync(join(__dirname, "..", "web", "channel-monitor.ts"), "utf-8")
 
 function sliceFn(name: string): string {
-  const start = src.indexOf("export function " + name)
+  const start = src.indexOf("function " + name)
   expect(start, name + " not found").toBeGreaterThan(0)
   const end = src.indexOf("\n}\n", start)
   expect(end, name + " closing brace not found").toBeGreaterThan(start)
   return src.slice(start, end)
 }
 
-describe("respawnMainSessionFresh: the session may be gone after the reap", () => {
-  const body = sliceFn("respawnMainSessionFresh")
+describe("respawnMarveenSessionFreshRaw: the session may be gone after the reap", () => {
+  const body = sliceFn("respawnMarveenSessionFreshRaw")
 
-  it("guards the respawn with a session-existence check", () => {
-    expect(body).toMatch(/if \(mainChannelsSessionExists\(\)\)/)
+  it("limits the recreate fallback to a provably missing pane or session", () => {
+    expect(body).toMatch(/can't find pane\|can't find session\|no server running\|session not found/)
   })
 
-  it("respawn-pane runs only inside that guard, not unconditionally", () => {
-    const guardAt = body.indexOf("mainChannelsSessionExists()")
+  it("tries respawn-pane before classifying a missing-session failure", () => {
     const respawnAt = body.indexOf("'respawn-pane'")
+    const guardAt = body.indexOf("can't find pane|can't find session")
     expect(respawnAt, "respawn-pane call not found").toBeGreaterThan(0)
-    expect(respawnAt).toBeGreaterThan(guardAt)
+    expect(guardAt, "missing-session classifier not found").toBeGreaterThan(respawnAt)
   })
 
   it("relaunches through channels.sh (the guard's path), not a bespoke tmux command", () => {
-    expect(body).toMatch(/createMainChannelsSession\(\)/)
+    expect(body).toMatch(/createMainChannelsSession\(attemptId\)/)
     // A hand-rolled `tmux new-session` here is the drift this comment warns about: it would
     // miss the first-run dialog handling, the /rename and the plugin bring-up.
     expect(body).not.toMatch(/'new-session'/)
   })
 
-  it("throws when the relaunch could not start anything (no silent success)", () => {
-    expect(body).toMatch(/mainRelaunchSucceeded\(created\)/)
-    expect(body).toMatch(/throw new Error\(/)
+  it("returns success only for a started or grace-protected relaunch", () => {
+    expect(body).toMatch(/return result === 'started' \|\| result === 'grace'/)
+    expect(body).toContain('return false')
   })
 
   it("stamps the respawn on the relaunch path too, so the watchers stand aside while it boots", () => {

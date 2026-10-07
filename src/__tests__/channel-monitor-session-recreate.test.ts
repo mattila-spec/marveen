@@ -71,9 +71,9 @@ describe("channel-monitor: self-healing vanished main session", () => {
     // createMainChannelsSession() instead of dead-ending (root-caused 2026-08-06:
     // respawn-pane looped on 'can't find pane' for hours while the session was
     // absent, and the main channel stayed down).
-    const fn = sliceFn("respawnMarveenSessionFresh")
+    const fn = sliceFn("respawnMarveenSessionFreshRaw")
     expect(fn).toContain("can't find pane")
-    expect(fn).toContain("createMainChannelsSession()")
+    expect(fn).toContain("createMainChannelsSession(attemptId)")
   })
 
   it("resumeMarveenSession writes the shared respawn stamp (2026-06-08 self-defer fix)", () => {
@@ -83,11 +83,11 @@ describe("channel-monitor: self-healing vanished main session", () => {
     // watcher-triggered resume. The 2026-06-08 false-positive loop respawned
     // the session 13 times in 8h because every fresh respawn left a residual
     // TUI footer the watcher then re-classified as a wedge.
-    const start = src.indexOf("export async function resumeMarveenSession")
-    expect(start, "resumeMarveenSession not found").toBeGreaterThan(0)
+    const start = src.indexOf("async function resumeMarveenSessionRaw")
+    expect(start, "resumeMarveenSessionRaw not found").toBeGreaterThan(0)
     // Slice generously to the next top-level export so the assertion catches
     // a stamp call anywhere inside the function, not just before the next "\n}\n".
-    const end = src.indexOf("\nexport ", start + 1)
+    const end = src.indexOf("\nexport async function resumeMarveenSession", start + 1)
     const fn = end > start ? src.slice(start, end) : src.slice(start)
     expect(fn).toContain("writeRespawnStamp()")
     // It must appear before the successful return so a failed respawn does

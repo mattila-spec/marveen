@@ -94,7 +94,7 @@ describe('POST /api/messages sender guards (runtime)', () => {
   it('rejects an unregistered local recipient with 400 at once', async () => {
     const r = await post({ from: MAIN_AGENT_ID, to: 'PLACEHOLDER', content: 'placeholder' })
     expect(r.statusCode).toBe(400)
-    expect(String(r.json.error)).toContain('unknown recipient')
+    expect(String(r.json.error)).toContain('Unknown local agentId')
   })
 
   // Warn, never block: a lookalike letter must come back as a warning on a
