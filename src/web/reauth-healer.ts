@@ -511,7 +511,7 @@ export function checkSession(label: string, session: string, isMain: boolean, qu
                 logger.info('reauth-healer: main dead-token restart skipped -- within cross-path respawn grace')
                 return
               }
-              const r2 = hardRestartMarveenChannels()
+              const r2 = hardRestartMarveenChannels({ automatic: true, actor: 'reauth-healer' })
               logger.warn({ ok: r2.ok }, 'reauth-healer: main dead-token restart triggered')
             }).catch((err) => logger.debug({ err }, 'reauth-healer: main dead-token restart import failed'))
           }

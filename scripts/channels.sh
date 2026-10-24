@@ -523,6 +523,7 @@ fi
 # at a fixture file instead of a live store/.
 CHANNELS_EXITS_LOG="${CHANNELS_EXITS_LOG:-$INSTALL_DIR/store/channels-exits.log}"
 record_channels_exit() {
+  if declare -F self_healing_abort >/dev/null; then self_healing_abort "channels launcher exited before verified recovery"; fi
   _rc="$1"
   # LAUNCHGATE1008: a gate refusal from a checkout that is not an install (no store/)
   # has already said why on stderr; the exit row would only add two failure lines.
@@ -601,6 +602,8 @@ if [ ! -f "$INSTALL_DIR/.env" ]; then
   exit 3
 fi
 # LAUNCHGATE1008-END: everything below launches.
+. "$INSTALL_DIR/scripts/lib/self-healing-launch.sh" || exit 73
+self_healing_claim channels-launcher || exit 73
 
 # Self-healing guard: ensure PLUGIN_ID is enabled in the PROJECT settings.json
 # before launch. A PR review-reset or branch-switch that reverts
@@ -1294,6 +1297,7 @@ if command -v node >/dev/null 2>&1; then
 fi
 
 # Régi session takarítás
+node "$INSTALL_DIR/scripts/sync-owner-rules.mjs" || exit 1
 $TMUX kill-session -t "=$SESSION:" 2>/dev/null
 
 # Reap orphan main-agent channel pollers (bun/node grandchildren of the
@@ -1608,6 +1612,7 @@ esac
 # for 30 minutes. With the network up this is one lookup per host.
 # shellcheck disable=SC2046,SC2086
 wait_for_channel_hosts $(channel_wait_hosts "$CHANNEL_PROVIDER" $CHANNEL_PLUGINS_EXTRA) || true
+node "$INSTALL_DIR/scripts/sync-owner-rules.mjs" || exit 1
 $TMUX kill-session -t "=$SESSION:" 2>/dev/null || true
 # TMUXSERVERREAP929: create the session WITHOUT this shell's state-dir var in
 # the tmux client's environment. The export above is meant for THIS session's
@@ -1639,6 +1644,7 @@ _tmux_set_auth_globals
 # remain-on-exit on, the pane survives as "dead" and the relaunch can always
 # find and reuse it. (Also fixed at the reap itself, see channel-poller-reap.ts;
 # this is the defense-in-depth layer, not the only fix.)
+self_healing_watch "$SESSION"
 $TMUX set-option -t "=$SESSION:" remain-on-exit on 2>/dev/null || true
 $TMUX set-environment -g -u "$STATE_ENV_VAR" 2>/dev/null || true
 
@@ -1713,6 +1719,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         # invasive change (a stable fallback dir + a seeded ~/.claude.json project
         # entry); see the PR description / card 7EB18437.
         [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
+        node "$INSTALL_DIR/scripts/sync-owner-rules.mjs" || exit 1
         env -u "$STATE_ENV_VAR" $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
           "${AUTH_PANE_ENV}${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${CUSTOM_PROVIDER_ENV}$CLAUDE --dangerously-skip-permissions${EXTRA_SETTINGS_FLAG} ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
         # See the primary new-session above: remain-on-exit keeps the pane

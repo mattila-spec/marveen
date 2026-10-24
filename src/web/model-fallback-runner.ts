@@ -151,7 +151,7 @@ async function restartFor(name: string): Promise<void> {
     // ENOENT into the caller's catch. hardRestartMarveenChannels() keeps the
     // launchd path for macOS installs and its Linux respawn-pane path re-reads
     // settings.json the same way.
-    const res = hardRestartMarveenChannels()
+    const res = hardRestartMarveenChannels({ automatic: true, actor: 'model-fallback' })
     if (!res.ok) throw new Error(res.error ?? 'main channels hard restart failed')
   } else {
     // 'continue' (fresh: false) re-spawns with --continue so the conversation

@@ -129,7 +129,9 @@ EXTRA_SETTINGS_FLAG="$(main_extra_settings_flag "$INSTALL_DIR" $CHANNEL_PLUGINS_
 # session); assigning the binary path to it corrupts server-socket detection.
 TMUX_BIN="$(command -v tmux)"
 CLAUDE="$(command -v claude)"
-if [ -z "$TMUX_BIN" ] || [ -z "$CLAUDE" ]; then
+CODEX_RECOVERY=0
+if [ "${MARVEEN_AGENT_BACKEND:-}" = codex ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then CODEX_RECOVERY=1; fi
+if [ -z "$TMUX_BIN" ] || { [ -z "$CLAUDE" ] && [ "$CODEX_RECOVERY" != 1 ]; }; then
   log "tmux or claude not on PATH; cannot act. PATH=$PATH"
   exit 0
 fi
@@ -231,7 +233,7 @@ MODEL_FLAG=""
 # never lands in the RESPAWN_CMD string passed to tmux respawn-pane (visible
 # via ps/pane history otherwise).
 CFG_ENV=""
-if [ -n "$NODE_BIN" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
+if [ "$CODEX_RECOVERY" != 1 ] && [ -n "$NODE_BIN" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
   # Contract on fd 3, never stdout -- see scripts/main-agent-isolated-config.mjs
   # and channels.sh: the helper imports a pino-logging module that writes to fd 1
   # from a worker thread, and one such line silently dropped the main agent back
@@ -299,10 +301,18 @@ if [ "$AUTHDEAD" = true ]; then
 fi
 
 log "$reason and session up -- respawn-pane $SESSION (respawn #$((count+1)))"
+node "$INSTALL_DIR/scripts/sync-owner-rules.mjs" || exit 1
+. "$INSTALL_DIR/scripts/lib/self-healing-launch.sh" || exit 73
+self_healing_claim channel-watchdog || { log "STOP: shared recovery gate denied attempt"; exit 0; }
+trap 'self_healing_abort "channel-watchdog restart did not succeed"' EXIT
+if [ "${MARVEEN_AGENT_BACKEND:-}" = codex ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
+  RESPAWN_CMD="/bin/bash $(sh_single_quote "$INSTALL_DIR/scripts/codex-channels.sh") --pane"
+fi
 if "$TMUX_BIN" respawn-pane -k -t "=$SESSION:" "$RESPAWN_CMD" 2>/dev/null; then
   date +%s > "$RESPAWN_STAMP"
   echo $(( count + 1 )) > "$RESPAWN_COUNT_FILE"
   rm -f "$AUTH_DEAD_COUNT_FILE" 2>/dev/null || true
+  self_healing_watch "$SESSION"
   log "respawn-pane issued"
 else
   log "respawn-pane FAILED for $SESSION"

@@ -91,6 +91,10 @@ function paneIsIdle(session: string, host: string | null): boolean {
 // symptom was invisible: a log line nobody reads, while the dashboard showed
 // auto-restart as enabled and correctly scheduled.
 function restartMainChannelsSession(): void {
+  if (process.env.MARVEEN_AGENT_BACKEND === 'codex') {
+    respawnMainSessionFresh()
+    return
+  }
   if (mainRestartMechanism(existsSync('/bin/launchctl')) === 'launchd') {
     const uid = typeof process.getuid === 'function' ? process.getuid() : ''
     // Label keys off SERVICE_ID (defaults to MAIN_AGENT_ID) so it matches the
