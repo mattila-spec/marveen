@@ -11,7 +11,7 @@ import { readCanonicalOwnerRules, workerDeveloperInstructions } from '../../scri
 const roots: string[] = []
 const begin = '<!-- BEGIN GENERATED: owner-operating-rules -->'
 const end = '<!-- END GENERATED: owner-operating-rules -->'
-const rules = '# Owner rules\n\n1. Owner decides.\n2. Verify completion.\n3. Keep owner informed.\n'
+const rules = readFileSync(join(PROJECT_ROOT, 'AGENTS.md'), 'utf8')
 function fixture(name = MAIN_AGENT_ID) {
   const root = mkdtempSync(join(tmpdir(), 'owner-rules-')); roots.push(root)
   const agentsBaseDir = join(root, 'agents')
@@ -31,7 +31,7 @@ function assertBlock(prompt: string, source = rules) {
   expect(text).toContain('# Existing persona\nKeep this.')
 }
 describe('canonical owner rules synchronization', () => {
-  it.each([MAIN_AGENT_ID, 'existing-agent', 'newly-scaffolded-agent'])('syncs exactly one complete block for %s', name => {
+  it.each([MAIN_AGENT_ID, 'gazdasagi-vezeto', 'procurement-logistics-lead', 'existing-agent', 'newly-scaffolded-agent'])('syncs exactly one complete block for %s', name => {
     const f = fixture(name)
     ensureOwnerOperatingRulesSection(name, f.paths); assertBlock(f.prompt)
     const once = readFileSync(f.prompt, 'utf8')
@@ -40,7 +40,7 @@ describe('canonical owner rules synchronization', () => {
   })
   it('refreshes the block after a canonical source change', () => {
     const f = fixture(); ensureOwnerOperatingRulesSection(MAIN_AGENT_ID, f.paths)
-    const updated = rules.replace('Owner decides.', 'Owner makes final decisions.')
+    const updated = rules + '\nApproved source update fixture.\n'
     writeFileSync(join(f.root, 'AGENTS.md'), updated)
     ensureOwnerOperatingRulesSection(MAIN_AGENT_ID, f.paths); assertBlock(f.prompt, updated)
   })
@@ -49,12 +49,13 @@ describe('canonical owner rules synchronization', () => {
     writeFileSync(f.prompt, readFileSync(f.prompt, 'utf8') + begin + '\nold\n' + end)
     ensureOwnerOperatingRulesSection(MAIN_AGENT_ID, f.paths); assertBlock(f.prompt)
   })
-  it.each(['source', 'prompt', 'empty', 'broken-marker'])('fails closed for %s without changing the prompt', kind => {
+  it.each(['source', 'prompt', 'empty', 'broken-marker', 'nested-marker'])('fails closed for %s without changing the prompt', kind => {
     const f = fixture()
     if (kind === 'source') rmSync(join(f.root, 'AGENTS.md'))
     if (kind === 'prompt') rmSync(f.prompt)
     if (kind === 'empty') writeFileSync(join(f.root, 'AGENTS.md'), '  ')
     if (kind === 'broken-marker') writeFileSync(f.prompt, 'persona\n' + begin)
+    if (kind === 'nested-marker') writeFileSync(f.prompt, 'persona\n' + begin + '\n' + begin + '\nold\n' + end)
     const previous = existsSync(f.prompt) ? readFileSync(f.prompt, 'utf8') : null
     expect(() => ensureOwnerOperatingRulesSection(MAIN_AGENT_ID, f.paths)).toThrow()
     expect(existsSync(f.prompt) ? readFileSync(f.prompt, 'utf8') : null).toBe(previous)
@@ -152,5 +153,57 @@ lines.on('line', line => {
     expect(out.status).not.toBe(0)
     expect(out.stderr).toContain('Required owner rules')
     expect(out.stderr).not.toContain('must-not-start')
+  })
+})
+
+// Exercise the standalone launch gate against the same compiled implementation
+// used by dashboard startup, without starting a model or a tmux session.
+describe('standalone Claude launch gate', () => {
+  it('synchronizes the full source and rejects a missing source before launch', () => {
+    const f = fixture()
+    const run = () => spawnSync(process.execPath, [join(PROJECT_ROOT, 'scripts/sync-owner-rules.mjs'), f.root], {
+      cwd: PROJECT_ROOT, encoding: 'utf8', timeout: 15000,
+    })
+    const first = run()
+    expect(first.status, first.stderr).toBe(0)
+    assertBlock(f.prompt)
+    const once = readFileSync(f.prompt, 'utf8')
+    expect(run().status).toBe(0)
+    expect(readFileSync(f.prompt, 'utf8')).toBe(once)
+    rmSync(join(f.root, 'AGENTS.md'))
+    const failed = run()
+    expect(failed.status).not.toBe(0)
+    expect(failed.stderr).toContain('Required owner rules')
+    expect(readFileSync(f.prompt, 'utf8')).toBe(once)
+  })
+})
+
+
+describe('dashboard Claude resume gate', () => {
+  it('a missing source prevents the actual resume function from replacing the pane', async () => {
+    const f = fixture()
+    rmSync(join(f.root, 'AGENTS.md'))
+    const source = readFileSync(join(PROJECT_ROOT, 'src/web/channel-monitor.ts'), 'utf8')
+    const ast = ts.createSourceFile('monitor.ts', source, ts.ScriptTarget.Latest, true)
+    const fn = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'resumeMarveenSession')!
+    const javascript = ts.transpileModule('(' + fn.getText(ast).replace('export ', '') + ')', {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+    }).outputText
+    const replacePane = vi.fn()
+    const endRespawn = vi.fn()
+    const resume = runInNewContext(javascript, {
+      getProvider: () => ({ type: 'telegram', pluginId: 'fixture' }), getMainAgentProvider: () => 'telegram',
+      beginMainRespawn: () => endRespawn, reapChannelOrphans: vi.fn(), reapDetachedChannelClaudes: vi.fn(),
+      tmuxBin: () => 'fixture-tmux', PROJECT_ROOT: f.root, MAIN_AGENT_ID,
+      ensureSharedClaudeOnboarded: vi.fn(), claudeBin: () => 'fixture-claude',
+      buildMainSessionRespawnCmd: () => 'fixture-command', readExtraChannelPluginIds: () => [],
+      writeMainExtraPluginsSettings: vi.fn(), mainChannelStateEnv: vi.fn(), readConfiguredMainModel: vi.fn(),
+      resolveMainConfigDecision: vi.fn(), execFileSync: replacePane,
+      ensureOwnerOperatingRulesSection: (name: string) => ensureOwnerOperatingRulesSection(name, f.paths),
+      logger: { warn: vi.fn(), error: vi.fn() },
+    }) as () => Promise<boolean>
+    expect(await resume()).toBe(false)
+    expect(replacePane).not.toHaveBeenCalled()
+    expect(endRespawn).toHaveBeenCalledOnce()
   })
 })

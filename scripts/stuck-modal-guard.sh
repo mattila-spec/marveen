@@ -415,6 +415,7 @@ run_guard() {
   log "stuck modal not cleared by Escape -- respawn-pane $SESSION (respawn #$((count+1)))"
   # G: alert ONLY after the respawn-pane actually succeeds, so a failed respawn
   # never sends the owner a false "respawned" message.
+  node "$INSTALL_DIR/scripts/sync-owner-rules.mjs" || exit 1
   if [ -n "$CLAUDE" ] && "$TMUX_BIN" respawn-pane -k -t "=$SESSION:" "$RESPAWN_CMD" 2>/dev/null; then
     date +%s > "$RESPAWN_STAMP" 2>/dev/null || true
     echo $(( count + 1 )) > "$RESPAWN_COUNT_FILE" 2>/dev/null || true

@@ -75,7 +75,9 @@ export function ensureOwnerOperatingRulesSection(
   const existing = readFileSync(claudeMdPath, 'utf8')
   const matches = [...existing.matchAll(new RegExp(OWNER_RULES_BLOCK_RE.source, 'g'))]
   const remaining = existing.replace(new RegExp(OWNER_RULES_BLOCK_RE.source, 'g'), '')
-  if (remaining.includes(OWNER_RULES_BEGIN) || remaining.includes(OWNER_RULES_END)) throw new Error(`Malformed owner rules markers: ${claudeMdPath}`)
+  if (remaining.includes(OWNER_RULES_BEGIN) || remaining.includes(OWNER_RULES_END) || matches.some(match =>
+    match[0].split(OWNER_RULES_BEGIN).length !== 2 || match[0].split(OWNER_RULES_END).length !== 2,
+  )) throw new Error(`Malformed owner rules markers: ${claudeMdPath}`)
   let replaced = false
   const updated = matches.length
     ? existing.replace(new RegExp(OWNER_RULES_BLOCK_RE.source, 'g'), () => { if (replaced) return ''; replaced = true; return block })

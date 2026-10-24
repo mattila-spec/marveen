@@ -1,3 +1,4 @@
+import { ensureOwnerOperatingRulesSection } from './agent-scaffold.js'
 import { tmuxStderr } from './tmux-stderr.js'
 import { writeMainExtraPluginsSettings } from './main-extra-plugins-settings.js'
 import { decideSkipTrace, decideMenuPassTrace, type SkipTraceState } from './monitor-trace.js'
@@ -1261,6 +1262,7 @@ export function respawnMainSessionFresh(): void {
     // paths drift apart. 'grace' means a launch is already in flight and the session is booting;
     // that is a success for our purposes (something IS coming up), not a failure to retry.
     if (mainChannelsSessionExists()) {
+      ensureOwnerOperatingRulesSection(MAIN_AGENT_ID)
       execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
     } else {
       // A fresh session starts its own claude: the respawn-specific follow-ups below
@@ -1356,6 +1358,7 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
       // preserving the prior shared-root behaviour.
       config: resolveMainConfigDecision(),
     })
+    ensureOwnerOperatingRulesSection(MAIN_AGENT_ID)
     if (opts.byMonitor) monitorMainRespawnAt = Date.now()
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
 
@@ -1659,6 +1662,7 @@ function respawnMarveenSessionFresh(): boolean {
       // itself or it 401s on the rotating macOS Keychain. null when off/no token.
       config: resolveMainConfigDecision(),
     })
+    ensureOwnerOperatingRulesSection(MAIN_AGENT_ID)
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
     logger.warn({ provider: provider.type }, 'Hard restart: marveen session respawned fresh (no --continue)')
     // Re-establish /rename on the fresh process (see note in resumeMarveenSession).

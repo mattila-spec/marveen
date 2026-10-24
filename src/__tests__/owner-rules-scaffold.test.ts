@@ -1,10 +1,11 @@
 import { afterAll, expect, it, vi } from 'vitest'
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-const fixture = vi.hoisted(() => ({ root: '' }))
+const fixture = vi.hoisted(() => ({ root: '', rules: '' }))
 vi.mock('../config.js', async original => {
   const config = await original<typeof import('../config.js')>()
   const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path')
+  fixture.rules = fs.readFileSync(path.join(config.PROJECT_ROOT, 'AGENTS.md'), 'utf8')
   fixture.root = fs.mkdtempSync(path.join(os.tmpdir(), 'owner-scaffold-'))
   return { ...config, PROJECT_ROOT: fixture.root, STORE_DIR: path.join(fixture.root, 'store') }
 })
@@ -15,7 +16,7 @@ vi.mock('../web/agent-config.js', async original => ({
 import { scaffoldAgentDir, ensureOwnerOperatingRulesSection } from '../web/agent-scaffold.js'
 afterAll(() => { if (fixture.root) rmSync(fixture.root, { recursive: true, force: true }) })
 it('a genuinely scaffolded new agent receives canonical rules before its first launch', () => {
-  const rules = '# Approved fixture rules\n1. Owner decides.\n2. Verify completion.\n3. Keep owner informed.\n'
+  const rules = fixture.rules
   writeFileSync(join(fixture.root, 'AGENTS.md'), rules)
   scaffoldAgentDir('fresh-owner-fixture')
   const dir = join(fixture.root, 'agents', 'fresh-owner-fixture')

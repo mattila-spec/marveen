@@ -27,3 +27,24 @@ The production checkout still has unrelated tracked edits: a dirty-tree prefligh
 must stop rollout without AUTO_STASH, reset, or commit-hook overrides.
 Runtime acceptance is pending until an approved release is actually deployed;
 unit/build success is not evidence of running agent prompt loading.
+
+## Source-only follow-up (2026-10-24)
+
+The isolated source now uses the complete approved rules 1?5, copied byte for
+byte from the owner's canonical AGENTS.md. The existing regression fixtures now
+exercise that complete source, including the existing economic and procurement
+agents and newly scaffolded agents. Rule text and outgoing-message approvals
+are unchanged. No deadline has been accepted.
+
+Standalone Claude channel cold starts, retries, channel watchdog recovery,
+stuck-modal recovery, agent watchdog starts, and dashboard main-pane recovery
+now call the existing synchronizer before launching the replacement process.
+The shell gate uses the compiled synchronizer through scripts/sync-owner-rules.mjs;
+a missing build or canonical source aborts launch. Diagnostic script modes remain
+read-only. This gate does not reload an already running model context.
+
+The initial follow-up was source-only. MAG Attila subsequently authorized review,
+release decisions and controlled production validation on 2026-10-24. Existing
+review, release and dirty-tree guards still apply. Production prompt files were
+inspected read-only; file contents are not proof that a running session consumed
+those contents. A nested malformed managed block now fails closed as well.
