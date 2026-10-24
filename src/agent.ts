@@ -1,4 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk'
+import { usesCodex, runCodexWorker } from './codex-backend.js'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
@@ -6,6 +7,7 @@ import { PROJECT_ROOT } from './config.js'
 
 const TYPING_REFRESH_MS = 4000
 import { logger } from './logger.js'
+import { isFleetFrozen } from './web/fleet-freeze.js'
 
 const AGENT_TIMEOUT_MS = Number(process.env.MARVEEN_AGENT_TIMEOUT_MS) || 20 * 60 * 1000
 
@@ -141,7 +143,19 @@ export async function runAgent(
   env?: Record<string, string | undefined>,
   opts: RunAgentOpts = {},
 ): Promise<{ text: string | null; newSessionId?: string; error?: string }> {
+  // KILLSWITCH1022: every dashboard-side Claude call (the daily digest, the
+  // schedule-expansion routes, capability summaries...) goes through here, on a
+  // session that runs tools. A frozen fleet starts none of them.
+  if (isFleetFrozen()) {
+    logger.warn({ caller: new Error().stack?.split('\n')[2]?.trim() }, 'runAgent refused: fleet frozen (KILLSWITCH1022)')
+    return { text: null, error: 'fleet frozen (KILLSWITCH1022)' }
+  }
   const timeoutMs = opts.timeoutMs ?? AGENT_TIMEOUT_MS
+  if (usesCodex()) {
+    const typing = onTyping ? setInterval(onTyping, TYPING_REFRESH_MS) : undefined
+    try { return await runCodexWorker(message, cwd, timeoutMs, allowTools) }
+    finally { if (typing) clearInterval(typing) }
+  }
   if (agentBackend() === 'worker') {
     // The interactive worker is a single shared session with its own fixed,
     // isolated, NEUTRAL cwd/config -- so the SDK-era per-call cwd/env isolation

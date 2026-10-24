@@ -211,13 +211,22 @@ alert_owner() {
 
 # --- live guard ----------------------------------------------------------------
 run_guard() {
+  # Codex is an RPC host, not a Claude TUI: never send Escape or /mcp to it.
+  if [ "${MARVEEN_AGENT_BACKEND:-}" = codex ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
+    log "Codex backend: Claude modal recovery is not applicable"
+    return 0
+  fi
   local TMUX_BIN CLAUDE MAIN_AGENT_ID SESSION pane state firstseen now action
 
   # NB: use TMUX_BIN, not TMUX -- the latter is tmux's own env var (socket,pid,
   # session); assigning the binary path to it corrupts server-socket detection.
   local MODE; MODE="$(resolve_mode)"
   [ "$MODE" = off ] && return 0
-  TMUX_BIN="$(command -v tmux)"; CLAUDE="$(command -v claude)"
+  # NATIVECLAUDEFIRST1011 (#1896): the native launcher first for the claude the
+  # respawn runs. An already installed Mac keeps its launchd plist (update.sh
+  # does not rewrite a loaded job), whose PATH puts /opt/homebrew/bin first.
+  TMUX_BIN="$(command -v tmux)"
+  CLAUDE="$HOME/.local/bin/claude"; [ -x "$CLAUDE" ] || CLAUDE="$(command -v claude)"
   if [ -z "$TMUX_BIN" ]; then log "tmux not on PATH; cannot act"; return 0; fi
 
   # Ensure the state dir exists BEFORE any stamp/lock write. Without it, a cold
@@ -285,19 +294,23 @@ run_guard() {
       log "STUCK modal confirmed ($(( now - firstseen ))s) -> Escape (max ${MAX_ESCAPES}x)" ;;
   esac
 
+  . "$INSTALL_DIR/scripts/lib/self-healing-launch.sh" || return 73
+  self_healing_claim stuck-modal-guard || { log "STOP: shared recovery gate denied attempt"; return 0; }
+  trap 'self_healing_abort "stuck-modal recovery did not restore health"' EXIT
+
   # --- recovery: Escape (bounded), like ensure_modal_closed --------------------
   local i p
   for i in $(seq 1 "$MAX_ESCAPES"); do
     p="$("$TMUX_BIN" capture-pane -t "=$SESSION:" -p 2>/dev/null || true)"
     case "$(printf '%s' "$p" | classify_pane)" in
-      idle|busy) log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
+      idle|busy) self_healing_resolve "Escape restored an idle or busy pane"; log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
     esac
     "$TMUX_BIN" send-keys -t "=$SESSION:" Escape 2>/dev/null || true
     sleep 0.5
   done
   p="$("$TMUX_BIN" capture-pane -t "=$SESSION:" -p 2>/dev/null || true)"
   case "$(printf '%s' "$p" | classify_pane)" in
-    idle|busy) log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
+    idle|busy) self_healing_resolve "Escape restored an idle or busy pane"; log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
   esac
 
   # --- still stuck: respawn-pane (cross-watchdog coordination via grace stamp) --
@@ -405,15 +418,18 @@ run_guard() {
   # session -- a respawn must not hand it a different python3 (#1626 review).
   . "$INSTALL_DIR/scripts/fleet-venv-prefix.sh" 2>/dev/null || fleet_venv_prefix() { :; }
   local FLEET_VENV_PREFIX; FLEET_VENV_PREFIX="$(fleet_venv_prefix "$INSTALL_DIR" "$STORE/channels-failures.log")"
-  local RESPAWN_CMD="export PATH=\"${FLEET_VENV_PREFIX}/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin\" && export CLAUDE_CODE_DISABLE_AGENT_VIEW=1 && { [ \"\$(id -u)\" != 0 ] || export IS_SANDBOX=1; } && ${CFG_ENV}$CLAUDE_Q --dangerously-skip-permissions ${MODEL_FLAG}--channels $PLUGIN_Q"
+  # NATIVECLAUDEFIRST1011: the same order as the channels.sh boot PATH (#1896).
+  local RESPAWN_CMD="export PATH=\"${FLEET_VENV_PREFIX}\$HOME/.local/bin:/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin\" && export CLAUDE_CODE_DISABLE_AGENT_VIEW=1 && { [ \"\$(id -u)\" != 0 ] || export IS_SANDBOX=1; } && ${CFG_ENV}$CLAUDE_Q --dangerously-skip-permissions ${MODEL_FLAG}--channels $PLUGIN_Q"
 
   log "stuck modal not cleared by Escape -- respawn-pane $SESSION (respawn #$((count+1)))"
   # G: alert ONLY after the respawn-pane actually succeeds, so a failed respawn
   # never sends the owner a false "respawned" message.
+  node "$INSTALL_DIR/scripts/sync-owner-rules.mjs" || exit 1
   if [ -n "$CLAUDE" ] && "$TMUX_BIN" respawn-pane -k -t "=$SESSION:" "$RESPAWN_CMD" 2>/dev/null; then
     date +%s > "$RESPAWN_STAMP" 2>/dev/null || true
     echo $(( count + 1 )) > "$RESPAWN_COUNT_FILE" 2>/dev/null || true
     rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true
+    self_healing_watch "$SESSION"
     log "respawn-pane issued"
     alert_owner "⚠️ The ${SESSION} session was stuck behind an open dialog -- auto-respawn #$((count+1)) issued. If you messaged during the outage and got no reply, please resend."
   else

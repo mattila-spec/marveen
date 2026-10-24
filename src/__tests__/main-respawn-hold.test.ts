@@ -79,6 +79,17 @@ vi.mock('../web/main-extra-plugins-settings.js', async (importOriginal) => {
   return { ...real, writeMainExtraPluginsSettings: vi.fn(() => null) }
 })
 
+// Keep this timing test isolated from repository prompt writes. The owner-rules
+// suite separately executes the real synchronizer and its fail-closed path.
+vi.mock('../web/agent-scaffold.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../web/agent-scaffold.js')>()
+  return { ...real, ensureOwnerOperatingRulesSection: vi.fn() }
+})
+
+vi.mock('../web/self-healing-recovery-gate.js', () => ({
+  claimMainRecovery: vi.fn(() => 'timing-fixture-attempt'), failMainRecovery: vi.fn(), watchMainRecovery: vi.fn(),
+}))
+
 import {
   decideMainRespawnHold,
   beginMainRespawn,
@@ -217,6 +228,6 @@ describe('wiring: every in-process respawn of the main session is marked', () =>
         .filter((i) => i >= 0),
     )
     expect(beginAt).toBeLessThan(firstWork)
-    expect(fn.trimEnd()).toMatch(/\} finally \{\n\s+endRespawn\(\)\n\s+\}\n\}$/)
+    expect(fn.trimEnd()).toMatch(/\} finally \{[\s\S]*\n    endRespawn\(\)\n  \}\n\}$/)
   })
 })

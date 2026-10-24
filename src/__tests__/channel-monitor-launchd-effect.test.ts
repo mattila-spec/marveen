@@ -54,7 +54,7 @@ describe('hardRestartMarveenChannels: launchd reload is verified by effect, not 
     // No `return` between the failed effect check and the respawn-pane call:
     // the whole point is that a no-effect reload must not end the function.
     const noEffectIdx = fnBody.indexOf('falling through to respawn-pane')
-    const respawnIdx = fnBody.indexOf('respawnMarveenSessionFresh()')
+    const respawnIdx = fnBody.indexOf('respawnMarveenSessionFresh(false, attempt || undefined)')
     expect(noEffectIdx, 'no-effect log line missing').toBeGreaterThan(0)
     expect(respawnIdx).toBeGreaterThan(noEffectIdx)
     expect(fnBody.slice(noEffectIdx, respawnIdx)).not.toMatch(/return \{ ok: true \}/)

@@ -5,10 +5,6 @@
   "effortLevel": "high",
   "permissions": {
     "deny": [
-      "Bash(curl *https://*)",
-      "Bash(*/curl *https://*)",
-      "Bash(wget *)",
-      "Bash(*/wget *)",
       "Bash(nc *)",
       "Bash(*/nc *)",
       "Bash(ncat *)",
@@ -147,6 +143,11 @@
           },
           {
             "type": "command",
+            "command": "bash -c '[ -f {{PROJECT_ROOT}}/scripts/hooks/taskstate-stub.py ] && exec python3 {{PROJECT_ROOT}}/scripts/hooks/taskstate-stub.py; exit 0'",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "bash -c '[ -f {{PROJECT_ROOT}}/scripts/hooks/provenance-gate.py ] && exec python3 {{PROJECT_ROOT}}/scripts/hooks/provenance-gate.py; exit 0'",
             "timeout": 10
           },
@@ -189,6 +190,16 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c '[ -f {{PROJECT_ROOT}}/scripts/hooks/fleet-freeze-gate.sh ] && exec bash {{PROJECT_ROOT}}/scripts/hooks/fleet-freeze-gate.sh; exit 0'",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "Read",
         "hooks": [

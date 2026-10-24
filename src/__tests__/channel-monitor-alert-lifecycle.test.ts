@@ -495,7 +495,7 @@ describe('maybeRestartWedgedMainChannel wiring', () => {
     expect(count(code, 'monitorMainRespawnAt')).toBe(7)
     expect(count(code, 'monitorMainRespawnAt =')).toBe(6)
     // The ladder's restart, the keep-alive respawn.
-    expect(fn).toMatch(/\n  const r = hardRestartMarveenChannels\(\)\n  lastStuckRestartAt = Date\.now\(\)\n  monitorMainRespawnAt = lastStuckRestartAt\n/)
+    expect(fn).toMatch(/\n  const r = hardRestartMarveenChannels\(\{ automatic: true, actor: 'channel-monitor' \}\)\n  lastStuckRestartAt = Date\.now\(\)\n  monitorMainRespawnAt = lastStuckRestartAt\n/)
     expect(src).toMatch(/\n    marveenLastKeepaliveRespawn = now\n    monitorMainRespawnAt = Date\.now\(\)\n/)
     // What dashboard routes, plan rotation and onboarding call never marks.
     for (const name of ['hardRestartMarveenChannels', 'respawnMarveenSessionFresh', 'createMainChannelsSession', 'restartMainForRotationContinue']) {
@@ -708,7 +708,7 @@ describe('stage-4 hard restart message reflects the result', () => {
     expect(stage).toMatch(new RegExp([
       '',
       "    const svcName = process\\.platform === 'linux' \\? 'systemctl' : 'launchctl'",
-      '    const r = hardRestartMarveenChannels\\(\\)',
+      "    const r = hardRestartMarveenChannels\\(\\{ automatic: true, actor: 'channel-monitor' \\}\\)",
       '    monitorMainRespawnAt = Date\\.now\\(\\)',
       "    if \\(!r\\.ok\\) logger\\.error\\(\\{ provider: providerLabel, err: r\\.error \\}, 'Stage-4 hard restart failed'\\)",
       '    sendAlert\\(hardRestartStageAlertText\\(svcName, MAIN_CHANNELS_SESSION, r\\)\\)',
@@ -723,7 +723,7 @@ describe('stage-4 hard restart message reflects the result', () => {
     const at = downCode.split("if (marveenDownState.stage === '') {").slice(0, nth + 1).join("if (marveenDownState.stage === '') {").length
     const stageCode = sliceBlock(downCode.slice(at), "if (marveenDownState.stage === '') {")
     expect(count(stageCode, 'sendAlert(')).toBe(1)
-    expect(count(stageCode, 'hardRestartMarveenChannels()')).toBe(1)
+    expect(count(stageCode, "hardRestartMarveenChannels({ automatic: true, actor: '' })")).toBe(1)
     expect(stage).not.toContain('Hard restart (${svcName}) most')
   })
 })

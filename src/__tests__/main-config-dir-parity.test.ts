@@ -53,8 +53,15 @@ describe('every shell respawn path carries the main-agent config decision (CFGDI
     // computed, logged and then left out of RESPAWN_CMD looks correct in review
     // and changes nothing at runtime.
     const cmdLines = src.split('\n').filter((l) => /RESPAWN_CMD="/.test(l))
-    expect(cmdLines.length).toBe(1)
-    expect(cmdLines[0]).toContain('${CFG_ENV}')
+    const codexCommands = cmdLines.filter((line) => line.includes('codex-channels.sh'))
+    const claudeCommands = cmdLines.filter((line) => !line.includes('codex-channels.sh'))
+    expect(claudeCommands).toHaveLength(1)
+    expect(claudeCommands[0]).toContain('${CFG_ENV}')
+    expect(codexCommands).toHaveLength(name === 'channel-watchdog.sh' ? 1 : 0)
+    for (const command of codexCommands) {
+      expect(command).toContain('--pane')
+      expect(command).not.toContain('${CFG_ENV}')
+    }
   })
 
   it('the shell respawners are EXACTLY these two -- a third one fails here first', () => {

@@ -1,3 +1,5 @@
+import { claimMainRecovery, failMainRecovery, watchMainRecovery } from './self-healing-recovery-gate.js'
+import { ensureOwnerOperatingRulesSection } from './agent-scaffold.js'
 import { tmuxStderr } from './tmux-stderr.js'
 import { writeMainExtraPluginsSettings } from './main-extra-plugins-settings.js'
 import { decideSkipTrace, decideMenuPassTrace, type SkipTraceState } from './monitor-trace.js'
@@ -17,7 +19,7 @@ import { listKanbanCards, createAgentMessage } from '../db.js'
 import {
   agentHasChannel,
   agentSessionName,
-  capturePane,
+  capturePane, capturePaneWithHistory,
   captureParkedInputView,
   clearInputBuffer,
   dismissResumeSummaryModalIfPresent,
@@ -39,6 +41,8 @@ import {
 } from './agent-process.js'
 import { sendSystemDirective } from './system-directive.js'
 import { isRestartInFlight, beginRestart, endRestart } from './restart-lock.js'
+import { paneRunsClaude, scheduleHardRestartVerify } from './hard-restart-verify.js'
+import { freshSupervisor, launchdReloadVerdict, reloadWindowSec, runningChannelsSupervisors, supervisorWaitDecision, type SupervisorWait } from './channels-supervisor.js'
 import { resolveMainConfigDecision, type MainConfigDecision } from './main-config-decision.js'
 import { runMainContinueRestart, type ContinueRestartResult } from './main-rotation-continue.js'
 import { withSessionSendLock } from './session-send-lock.js'
@@ -48,7 +52,6 @@ import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPlugin
 import { getInjectedPrompt, matchesInjectedPrompt } from './injected-prompt-registry.js'
 import {
   detectPaneState, idleConsideringDimGhost, detectQuotaWall, decidePaneErrorAlert, detectsBlockingMenu, detectsPermissionDialog, detectsFirstRunGate, detectsModelConsentDialog, type PaneErrorAlertState, type PaneState,
-  permissionPromptSummary,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
   parkedInputText, shouldClearTruncatedPreamble,
   parkedInputRowCount, submitLanded, decideStuckInputAction,
@@ -59,8 +62,9 @@ import {
 import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { recordChannelEvent } from './channel-event-log.js'
 import { notifyChannel, type AlertMeta } from '../notify.js'
-import { escalatePermissionPrompt, type PermPromptEscalationState } from './permission-prompt-escalation.js'
+import type { PermPromptEscalationState } from './permission-prompt-escalation.js'
 import { sendRoutineAlert } from './routine-alert.js'
+import { runPermissionPromptPass, clearPermissionPromptAlert } from './permission-prompt-alert.js'
 import { getProvider, channelStateDir, channelStateDirEnvVar, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
 import { readLastIngestionTimestampAcross, mainTranscriptDirs } from './inbound-probe.js'
@@ -82,6 +86,7 @@ import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detecto
 import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
 import { exactTmuxTarget } from '../tmux-target.js'
 import { beginMainRespawn } from './main-respawn-hold.js'
+import { whileNotFrozen } from './fleet-freeze.js'
 
 // Lazily resolved (see makeLazyBinResolver): a module-level `resolveFromPath`
 // const throws at IMPORT time, so any environment where the binary is not
@@ -937,7 +942,19 @@ function getMainAgentProvider(): ChannelProviderType {
 }
 
 function softReconnectMarveen(): boolean {
-  return attemptChannelMcpReconnect(MAIN_AGENT_ID).ok
+  const actor = 'channel-mcp-soft-reconnect'
+  if (process.env.MARVEEN_AGENT_BACKEND === 'codex') return hardRestartMarveenChannels({ automatic: true, actor }).ok
+  const attempt = claimMainRecovery(actor)
+  if (!attempt) return false
+  try {
+    const result = attemptChannelMcpReconnect(MAIN_AGENT_ID)
+    if (result.ok) watchMainRecovery(actor, attempt)
+    else failMainRecovery(actor, attempt, 'MCP reconnect was not accepted')
+    return result.ok
+  } catch (err) {
+    failMainRecovery(actor, attempt, String(err))
+    return false
+  }
 }
 
 async function triggerMarveenMemorySave(): Promise<void> {
@@ -1218,7 +1235,18 @@ export function respawnMainSessionFresh(): void {
   // #1954: mark the respawn for the schedule-runner from the START, not the
   // end (see main-respawn-hold.ts); the finally clears it on every exit.
   const endRespawn = beginMainRespawn()
+  const actor = 'scheduled-restart'
+  let attempt: string | null = null
+  let recoveryStarted = false
   try {
+    attempt = claimMainRecovery(actor)
+    if (!attempt) throw new Error('shared recovery gate denied scheduled main restart')
+    if (process.env.MARVEEN_AGENT_BACKEND === 'codex') {
+      const result = restartCodexChannels(attempt || undefined)
+      recoveryStarted = result.ok
+      if (!result.ok) throw new Error(result.error || 'Codex restart failed')
+      return
+    }
     // Same rationale as the resume path: respawn-pane -k kills the parent claude
     // but leaves grandchild pollers alive, and two pollers on one bot token race
     // for getUpdates (409). Reap BEFORE respawning, never after.
@@ -1258,11 +1286,13 @@ export function respawnMainSessionFresh(): void {
     // paths drift apart. 'grace' means a launch is already in flight and the session is booting;
     // that is a success for our purposes (something IS coming up), not a failure to retry.
     if (mainChannelsSessionExists()) {
+      ensureOwnerOperatingRulesSection(MAIN_AGENT_ID)
       execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
     } else {
       // A fresh session starts its own claude: the respawn-specific follow-ups below
       // (identity, plugin unlock) are channels.sh's job on this path, not ours.
-      relaunchGoneMainSession(createMainChannelsSession, writeRespawnStamp)
+      relaunchGoneMainSession(() => createMainChannelsSession(attempt || undefined), writeRespawnStamp)
+      recoveryStarted = true
       return
     }
     // Stamp IMMEDIATELY after the respawn, before the scheduling follow-ups.
@@ -1281,7 +1311,12 @@ export function respawnMainSessionFresh(): void {
     // or with the plugin stuck in `◯ disabled`.
     void scheduleIdentitySetup(MAIN_CHANNELS_SESSION, BOT_NAME)
     schedulePluginUnlockAfterRespawn(MAIN_CHANNELS_SESSION, provider.type)
+    recoveryStarted = true
   } finally {
+    if (attempt) {
+      if (recoveryStarted) watchMainRecovery(actor, attempt)
+      else failMainRecovery(actor, attempt, 'restart did not start successfully')
+    }
     endRespawn()
   }
 }
@@ -1308,7 +1343,17 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
   // #1954: mark the respawn for the schedule-runner from the START, not the
   // end (see main-respawn-hold.ts); the finally clears it on every exit.
   const endRespawn = beginMainRespawn()
+  const actor = 'channel-down-cascade-resume'
+  let attempt: string | null = null
+  let recoveryStarted = false
   try {
+    attempt = claimMainRecovery(actor)
+    if (!attempt) return false
+    if (process.env.MARVEEN_AGENT_BACKEND === 'codex') {
+      const result = restartCodexChannels(attempt || undefined)
+      recoveryStarted = result.ok
+      return result.ok
+    }
     // Reap any orphan bun/node poller BEFORE we respawn. tmux respawn-pane -k
     // kills the parent claude process but leaves grandchild pollers running -
     // see channel-poller-reap.ts. Without this, the freshly-respawned
@@ -1353,6 +1398,7 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
       // preserving the prior shared-root behaviour.
       config: resolveMainConfigDecision(),
     })
+    ensureOwnerOperatingRulesSection(MAIN_AGENT_ID)
     if (opts.byMonitor) monitorMainRespawnAt = Date.now()
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
 
@@ -1409,11 +1455,16 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
     // produced the 2026-06-08 false-positive loop (13 respawns in 8h on
     // residual 3-4s counters left over from the prior respawn's TUI redraw).
     writeRespawnStamp()
+    recoveryStarted = true
     return true
   } catch (err) {
     logger.error({ err }, 'Marveen session respawn failed')
     return false
   } finally {
+    if (attempt) {
+      if (recoveryStarted) watchMainRecovery(actor, attempt)
+      else failMainRecovery(actor, attempt, 'restart did not start successfully')
+    }
     endRespawn()
   }
 }
@@ -1559,6 +1610,8 @@ const CHANNELS_SCRIPT = join(PROJECT_ROOT, 'scripts', 'channels.sh')
 // recreated on the next 60s poll.
 const MAIN_SESSION_CREATE_GRACE_MS = 360_000
 let marveenLastSessionCreate = 0
+// CHANNELSDUP1023 follow-up: how long the recreate path has been waiting on a running supervisor.
+let supervisorWait: SupervisorWait | null = null
 
 export function mainChannelsSessionExists(): boolean {
   try {
@@ -1580,7 +1633,7 @@ export function mainChannelsSessionExists(): boolean {
 // collapsed both into a silent false success (PR #779 review).
 export type MainSessionCreateResult = 'started' | 'grace' | 'script-missing' | 'spawn-failed'
 
-export function createMainChannelsSession(): MainSessionCreateResult {
+export function createMainChannelsSession(attemptId?: string): MainSessionCreateResult {
   const now = Date.now()
   if (marveenLastSessionCreate && now - marveenLastSessionCreate < MAIN_SESSION_CREATE_GRACE_MS) {
     return 'grace'
@@ -1588,6 +1641,21 @@ export function createMainChannelsSession(): MainSessionCreateResult {
   if (!existsSync(CHANNELS_SCRIPT)) {
     logger.error({ script: CHANNELS_SCRIPT }, 'Cannot recreate main channels session: channels.sh missing')
     return 'script-missing'
+  }
+  // CHANNELSDUP1023: a supervisor that is already running owns this session -- it is between
+  // a kill-session and its rebuild, or in its own restart back-off. Starting a second one made
+  // two supervisors watch one session (measured 2026-10-22 13:10, channels-supervisor.ts).
+  const live = runningChannelsSupervisors(CHANNELS_SCRIPT)
+  const wait = supervisorWaitDecision(supervisorWait, now, live.length)
+  supervisorWait = wait.state
+  if (wait.verdict === 'stuck') {
+    logger.error({ session: MAIN_CHANNELS_SESSION, supervisors: live, absentSinceMs: now - wait.state!.since }, 'Main channels session still absent next to a running channels.sh supervisor -- the supervisor looks stuck; not starting a second one')
+    sendRoutineAlert('main-session-supervisor-stuck', `⚠️ A ${MAIN_CHANNELS_SESSION} session ${Math.round((now - wait.state!.since) / 60_000)} perce hiányzik, pedig fut channels.sh supervisor (pid ${live.map((s) => s.pid).join(', ')}): valószínűleg beragadt. Másodikat nem indítok mellé; kézi ellenőrzés kell.`)
+    return 'grace'
+  }
+  if (wait.verdict === 'wait') {
+    logger.warn({ session: MAIN_CHANNELS_SESSION, supervisors: live }, 'Main channels session absent, but a channels.sh supervisor is already running -- not starting a second one')
+    return 'grace'
   }
   try {
     // Detached + unref'd: channels.sh is a long-lived supervisor (it tails the
@@ -1598,6 +1666,7 @@ export function createMainChannelsSession(): MainSessionCreateResult {
       detached: true,
       stdio: 'ignore',
       cwd: PROJECT_ROOT,
+      ...(attemptId ? { env: { ...process.env, MARVEEN_SELF_HEALING_ATTEMPT_ID: attemptId } } : {}),
     })
     child.unref()
     marveenLastSessionCreate = now
@@ -1618,12 +1687,24 @@ export function createMainChannelsSession(): MainSessionCreateResult {
 // but starts a clean session -- exactly what scripts/channels.sh does -- so a
 // wedged plugin gets a brand-new process even on pure-tmux installs. Distinct
 // from the stage-3 resume (which keeps --continue) by clearing session state.
-function respawnMarveenSessionFresh(): boolean {
+function respawnMarveenSessionFresh(claimRecovery = true, inheritedAttempt?: string): boolean {
   const provider = getProvider(getMainAgentProvider())
   // #1954: mark the respawn for the schedule-runner from the START, not the
   // end (see main-respawn-hold.ts); the finally clears it on every exit.
   const endRespawn = beginMainRespawn()
+  const actor = 'channel-monitor-fresh-respawn'
+  let attempt: string | null = null
+  let recoveryStarted = false
   try {
+    if (claimRecovery) {
+      attempt = claimMainRecovery(actor)
+      if (!attempt) return false
+    }
+    if (process.env.MARVEEN_AGENT_BACKEND === 'codex') {
+      const result = restartCodexChannels(attempt || inheritedAttempt)
+      recoveryStarted = result.ok
+      return result.ok
+    }
     // Same first-run-picker guard as resumeMarveenSession.
     ensureSharedClaudeOnboarded()
     const claudeCmd = buildMainSessionRespawnCmd({
@@ -1639,6 +1720,7 @@ function respawnMarveenSessionFresh(): boolean {
       // itself or it 401s on the rotating macOS Keychain. null when off/no token.
       config: resolveMainConfigDecision(),
     })
+    ensureOwnerOperatingRulesSection(MAIN_AGENT_ID)
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
     logger.warn({ provider: provider.type }, 'Hard restart: marveen session respawned fresh (no --continue)')
     // Re-establish /rename on the fresh process (see note in resumeMarveenSession).
@@ -1651,6 +1733,7 @@ function respawnMarveenSessionFresh(): boolean {
     // leaving the channel offline until manual intervention.
     schedulePluginUnlockAfterRespawn(MAIN_CHANNELS_SESSION, provider.type)
     writeRespawnStamp() // coordinate with the systemd-timer watchdog (covers the keepalive path too)
+    recoveryStarted = true
     return true
   } catch (err) {
     // When the pane/session is entirely GONE (not just the claude process
@@ -1668,12 +1751,17 @@ function respawnMarveenSessionFresh(): boolean {
         { session: MAIN_CHANNELS_SESSION },
         'Fresh respawn: pane gone -- falling back to full session recreate (channels.sh)',
       )
-      const result = createMainChannelsSession()
-      return result === 'started' || result === 'grace'
+      const result = createMainChannelsSession(attempt || inheritedAttempt)
+      recoveryStarted = result === 'started' || result === 'grace'
+      return recoveryStarted
     }
     logger.error({ err }, 'Fresh session respawn failed')
     return false
   } finally {
+    if (attempt) {
+      if (recoveryStarted) watchMainRecovery(actor, attempt)
+      else failMainRecovery(actor, attempt, 'restart did not start successfully')
+    }
     endRespawn()
   }
 }
@@ -1771,68 +1859,151 @@ function mainPaneClaudePid(): number | null {
   }
 }
 
-export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
-  // FABLEFALL1: the restarted session boots from the main/worker shared config
-  // roots, which the per-agent spawn-time stamp never covers -- stamp them now
-  // so the model consent dialog cannot render on the fresh boot (change-only,
-  // no-op when already stamped).
-  try { stampFableOverageConsentSharedRoots() } catch { /* backstop handlers remain */ }
-  // macOS: bounce the launchd job when the plist exists. If the channels session
-  // is NOT managed by launchd on this install (plist absent -- only
-  // com.jarvis.dashboard exists), fall through to the respawn-pane path below.
-  // The previous unconditional launchctl call was a silent no-op: launchctl
-  // accepts a non-existent plist with exit 0, leaving the session untouched.
-  if (process.platform !== 'linux' && existsSync(MAIN_CHANNELS_PLIST)) {
-    const pidBefore = mainPaneClaudePid()
+// CHANNELSDUP1023 follow-up (b): tmux's `#{pane_dead}` for the main pane, or null when unreadable.
+function mainPaneDead(): boolean | null {
+  try {
+    const out = execFileSync(tmuxBin(), ['list-panes', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), '-F', '#{pane_dead}'],
+      { timeout: 3000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim().split('\n')[0]
+    return out === '1' ? true : out === '0' ? false : null
+  } catch {
+    return null
+  }
+}
+
+// A successful hard restart is measured once more, a few minutes later: a fresh supervisor that
+// could not bring claude up would otherwise go unnoticed (the reload already counted as done).
+function verifyHardRestartLater(): void {
+  scheduleHardRestartVerify(
+    () => paneRunsClaude(mainPaneDead(), getClaudePidForSession(MAIN_CHANNELS_SESSION)),
+    () => {
+      logger.error({ session: MAIN_CHANNELS_SESSION }, 'Hard restart reported success, but claude is not running in the main pane some minutes later')
+      sendRoutineAlert('main-hard-restart-no-claude', `⚠️ A ${MAIN_CHANNELS_SESSION} újraindítása után néhány perccel sem fut claude a fő pane-ben. A csatorna valószínűleg nem jött vissza; kézi ellenőrzés kell.`)
+    },
+  )
+}
+
+function restartCodexChannels(attemptId?: string): { ok: boolean; error?: string } {
+    const paneScript = join(PROJECT_ROOT, 'scripts', 'codex-channels.sh')
+    const pluginEnv = process.env.MARVEEN_CODEX_TELEGRAM_PLUGIN
+      ? `export MARVEEN_CODEX_TELEGRAM_PLUGIN=${shSingleQuote(process.env.MARVEEN_CODEX_TELEGRAM_PLUGIN)} && ` : ''
     try {
-      execFileSync('/bin/launchctl', ['unload', MAIN_CHANNELS_PLIST], { timeout: 5000 })
-      execFileSync('/bin/sleep', ['2'], { timeout: 4000 })
-      execFileSync('/bin/launchctl', ['load', MAIN_CHANNELS_PLIST], { timeout: 5000 })
-    } catch (err) {
-      logger.error({ err }, 'Hard restart failed (launchctl)')
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      execFileSync(tmuxBin(), ['respawn-pane', '-k', '-c', PROJECT_ROOT, '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), `${pluginEnv}/bin/bash ${shSingleQuote(paneScript)} --pane`], { timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] })
+      writeRespawnStamp()
+      return { ok: true }
+    } catch (error) {
+      const message = String(error)
+      if (/can't find pane|can't find session|no server running|session not found/i.test(message)) {
+        const created = createMainChannelsSession(attemptId)
+        return created === 'started' || created === 'grace'
+          ? { ok: true }
+          : { ok: false, error: `Codex session recreation failed: ${created}` }
+      }
+      return { ok: false, error: message }
     }
-    // The command returned 0. Now measure whether anything actually restarted:
-    // launchd needs a moment to tear the old process down and spawn the new one,
-    // so poll rather than read once.
-    let pidAfter = mainPaneClaudePid()
-    const deadline = Date.now() + LAUNCHD_EFFECT_TIMEOUT_MS
-    while (!launchdRestartTookEffect(pidBefore, pidAfter) && Date.now() < deadline) {
-      try { execFileSync('/bin/sleep', [String(LAUNCHD_EFFECT_POLL_MS / 1000)], { timeout: 4000 }) } catch { break }
-      pidAfter = mainPaneClaudePid()
+}
+
+export function hardRestartMarveenChannels(options: { automatic?: boolean; actor?: string } = {}): { ok: boolean; error?: string } {
+  const actor = options.actor || 'channel-monitor-hard-restart'
+  const endRespawn = beginMainRespawn()
+  let attempt: string | null = null
+  let recoveryStarted = false
+  try {
+    attempt = options.automatic ? claimMainRecovery(actor) : null
+    if (options.automatic && !attempt) return { ok: false, error: 'shared recovery gate denied automatic recovery; STOP and escalate' }
+    if (process.env.MARVEEN_AGENT_BACKEND === 'codex') {
+      const result = restartCodexChannels(attempt || undefined)
+      recoveryStarted = result.ok
+      return result
     }
-    if (launchdRestartTookEffect(pidBefore, pidAfter)) {
-      logger.warn({ pidBefore, pidAfter }, `Hard restart: launchctl reload of com.${SERVICE_ID}.channels`)
+    // FABLEFALL1: the restarted session boots from the main/worker shared config
+    // roots, which the per-agent spawn-time stamp never covers -- stamp them now
+    // so the model consent dialog cannot render on the fresh boot (change-only,
+    // no-op when already stamped).
+    try { stampFableOverageConsentSharedRoots() } catch { /* backstop handlers remain */ }
+    // macOS: bounce the launchd job when the plist exists. If the channels session
+    // is NOT managed by launchd on this install (plist absent -- only
+    // com.jarvis.dashboard exists), fall through to the respawn-pane path below.
+    // The previous unconditional launchctl call was a silent no-op: launchctl
+    // accepts a non-existent plist with exit 0, leaving the session untouched.
+    if (process.platform !== 'linux' && existsSync(MAIN_CHANNELS_PLIST)) {
+      const pidBefore = mainPaneClaudePid()
+      const reloadAt = Date.now()
+      try {
+        execFileSync('/bin/launchctl', ['unload', MAIN_CHANNELS_PLIST], { timeout: 5000 })
+        execFileSync('/bin/sleep', ['2'], { timeout: 4000 })
+        execFileSync('/bin/launchctl', ['load', MAIN_CHANNELS_PLIST], { timeout: 5000 })
+      } catch (err) {
+        logger.error({ err }, 'Hard restart failed (launchctl)')
+        return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      }
+      // The command returned 0. Now measure whether anything actually restarted:
+      // launchd needs a moment to tear the old process down and spawn the new one,
+      // so poll rather than read once.
+      let pidAfter = mainPaneClaudePid()
+      const deadline = Date.now() + LAUNCHD_EFFECT_TIMEOUT_MS
+      while (!launchdRestartTookEffect(pidBefore, pidAfter) && Date.now() < deadline) {
+        try { execFileSync('/bin/sleep', [String(LAUNCHD_EFFECT_POLL_MS / 1000)], { timeout: 4000 }) } catch { break }
+        pidAfter = mainPaneClaudePid()
+      }
+      if (launchdRestartTookEffect(pidBefore, pidAfter)) {
+        logger.warn({ pidBefore, pidAfter }, `Hard restart: launchctl reload of com.${SERVICE_ID}.channels`)
+        marveenLastHardRestart = Date.now()
+        writeRespawnStamp() // coordinate with the systemd-timer watchdog
+        noteOwnHardRestartStamp(marveenLastHardRestart)
+        verifyHardRestartLater()
+        recoveryStarted = true
+      return { ok: true }
+      }
+      // CHANNELSDUP1023: an unreadable pane after the reload is, by itself, no proof either way.
+      // A channels.sh that launchd started for THIS reload is: it is rebuilding the session
+      // (kill-session, then a cold start that outlasts the poll), so the reload took effect and
+      // falling through would launch a second supervisor on top of it.
+      if (pidBefore !== null && pidAfter === null) {
+        const fresh = freshSupervisor(runningChannelsSupervisors(CHANNELS_SCRIPT), reloadWindowSec(reloadAt, Date.now()))
+        if (launchdReloadVerdict(pidBefore, pidAfter, fresh?.pid ?? null) === 'rebuilding') {
+          logger.warn({ pidBefore, supervisor: fresh }, `Hard restart: launchctl reload of com.${SERVICE_ID}.channels -- a fresh channels.sh is rebuilding the session (the pane is not readable yet)`)
+          marveenLastHardRestart = Date.now()
+          writeRespawnStamp() // coordinate with the systemd-timer watchdog
+          noteOwnHardRestartStamp(marveenLastHardRestart)
+          verifyHardRestartLater()
+          recoveryStarted = true
+          return { ok: true }
+        }
+      }
+      logger.warn(
+        { pidBefore, pidAfter, plist: MAIN_CHANNELS_PLIST },
+        'Hard restart: launchctl reload exited 0 but the pane claude pid did not change -- launchd does not own this session; falling through to respawn-pane',
+      )
+      // fall through to the respawn-pane path below
+    }
+
+    // Plist-absent case only: the no-effect fall-through above logs its own,
+    // different reason, and claiming "plist absent" there would be false.
+    if (process.platform !== 'linux' && !existsSync(MAIN_CHANNELS_PLIST)) {
+      logger.warn({ plist: MAIN_CHANNELS_PLIST }, 'Hard restart: launchd channels plist absent -- falling back to respawn-pane')
+    }
+
+    // Linux: respawn-pane ONLY -- NEVER `systemctl --user restart`. The channels
+    // unit (e.g. marveen-channels.service) runs with KillMode=control-group and
+    // the shared tmux SERVER lives in its cgroup, so restarting the unit kills the
+    // tmux server and with it EVERY agent session, not just the main one.
+    // respawn-pane replaces only the claude process in the main channels pane,
+    // leaving the server and all other sessions intact.
+    if (respawnMarveenSessionFresh(false, attempt || undefined)) {
       marveenLastHardRestart = Date.now()
-      writeRespawnStamp() // coordinate with the systemd-timer watchdog
-      noteOwnHardRestartStamp(marveenLastHardRestart)
+      noteOwnHardRestartStamp(marveenLastHardRestart) // respawnMarveenSessionFresh wrote the stamp
+      verifyHardRestartLater()
+      recoveryStarted = true
       return { ok: true }
     }
-    logger.warn(
-      { pidBefore, pidAfter, plist: MAIN_CHANNELS_PLIST },
-      'Hard restart: launchctl reload exited 0 but the pane claude pid did not change -- launchd does not own this session; falling through to respawn-pane',
-    )
-    // fall through to the respawn-pane path below
+    return { ok: false, error: 'hard restart failed: tmux respawn-pane failed' }
+  } finally {
+    if (attempt) {
+      if (recoveryStarted) watchMainRecovery(actor, attempt)
+      else failMainRecovery(actor, attempt, 'hard restart did not start successfully')
+    }
+    endRespawn()
   }
-
-  // Plist-absent case only: the no-effect fall-through above logs its own,
-  // different reason, and claiming "plist absent" there would be false.
-  if (process.platform !== 'linux' && !existsSync(MAIN_CHANNELS_PLIST)) {
-    logger.warn({ plist: MAIN_CHANNELS_PLIST }, 'Hard restart: launchd channels plist absent -- falling back to respawn-pane')
-  }
-
-  // Linux: respawn-pane ONLY -- NEVER `systemctl --user restart`. The channels
-  // unit (e.g. marveen-channels.service) runs with KillMode=control-group and
-  // the shared tmux SERVER lives in its cgroup, so restarting the unit kills the
-  // tmux server and with it EVERY agent session, not just the main one.
-  // respawn-pane replaces only the claude process in the main channels pane,
-  // leaving the server and all other sessions intact.
-  if (respawnMarveenSessionFresh()) {
-    marveenLastHardRestart = Date.now()
-    noteOwnHardRestartStamp(marveenLastHardRestart) // respawnMarveenSessionFresh wrote the stamp
-    return { ok: true }
-  }
-  return { ok: false, error: 'hard restart failed: tmux respawn-pane failed' }
 }
 
 // 8c338dc4: the plan rotation's opt-in continue restart (POST /api/claude-plans/rotate with
@@ -1927,7 +2098,7 @@ function maybeRestartWedgedMainChannel(state: StuckInputState): void {
     return
   }
   logger.warn({ session: MAIN_CHANNELS_SESSION, attempts: state.attempts, restart: stuckLadder.count() + 1 }, 'Stuck main channel input survived soft recovery -- escalating to hard restart (respawn-pane)')
-  const r = hardRestartMarveenChannels()
+  const r = hardRestartMarveenChannels({ automatic: true, actor: 'channel-monitor' })
   lastStuckRestartAt = Date.now()
   monitorMainRespawnAt = lastStuckRestartAt
   if (r.ok) {
@@ -2453,7 +2624,7 @@ async function handleMarveenDown(): Promise<void> {
     marveenDownState.lastAlertAt = now
     logger.warn({ provider: providerLabel }, 'Marveen channel plugin still down -- stage 4 (hard restart)')
     const svcName = process.platform === 'linux' ? 'systemctl' : 'launchctl'
-    const r = hardRestartMarveenChannels()
+    const r = hardRestartMarveenChannels({ automatic: true, actor: 'channel-monitor' })
     monitorMainRespawnAt = Date.now()
     if (!r.ok) logger.error({ provider: providerLabel, err: r.error }, 'Stage-4 hard restart failed')
     sendAlert(hardRestartStageAlertText(svcName, MAIN_CHANNELS_SESSION, r))
@@ -2700,6 +2871,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       if (decision.next.firstSeenAt === null) {
         paneMenuState.delete(t.session)
         permPromptState.delete(t.session)
+        // PERMFLOOD1012: the spell is over, so a later prompt is a new question.
+        clearPermissionPromptAlert(t.session)
       } else {
         paneMenuState.set(t.session, decision.next)
       }
@@ -2752,19 +2925,20 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             // requests ~45s after they appeared, while the operator believed
             // they had approved them. Same rule as the unrecognised trust dialog
             // above: no keystroke is neutral, so send none and say so, loudly.
-            // Card 68cb6715: the main agent hears first (an inter-agent message,
-            // Escape only), the owner after PERM_PROMPT_OWNER_AFTER_MS if the same
-            // prompt still stands; the main agent's own prompt goes to the owner.
-            const escalation = escalatePermissionPrompt(permPromptState, {
-              session: t.session,
-              label,
+            // Card 68cb6715 + PERMFLOOD1012: this branch is reached once per dedup
+            // window for as long as nobody answers. The main agent hears first
+            // (an inter-agent message, Escape only); the owner hears at fixed
+            // marks of the prompt's age (the first one, 15 min by default, is the
+            // main agent's head start), and the message says what is asked. The
+            // main agent's own prompt goes to the owner on the same marks. The
+            // decision and both sends live in runPermissionPromptPass
+            // (permission-prompt-alert.ts), where they are under test.
+            const escalation = runPermissionPromptPass(label, t.session, paneNow, {
+              captureWithHistory: capturePaneWithHistory,
+              escalation: permPromptState,
               isMainAgent: t.isMarveen,
-              ask: permissionPromptSummary(paneNow),
-              now: Date.now(),
-              ownerText: `🔐 A(z) ${label} session egy engedélykérésen vár, és NEM nyomtam meg semmit: ott az Escape NEM-et jelentene. Döntsd el te: tmux attach -t ${t.session}`,
-            }, {
               messageMainAgent: (text) => { createAgentMessage('system', MAIN_AGENT_ID, text) },
-              alertOwner: (text, meta) => sendAlert(text, meta),
+              send: (text, meta) => sendAlert(text, meta),
             })
             logger.warn({ session: t.session, agent: label, escalation }, 'Blocking "menu" is a tool-permission prompt -- a human decides, NO keystrokes sent')
           } else {
@@ -3097,8 +3271,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // and no poller (verified: continue -> "Plugin not found" in /mcp; fresh
           // -> plugin loads + poller attaches). Context is dropped, memory persists.
           // startAgentProcess schedules the recovery brief itself for any
-          // fresh start (see agent-process): this path is no longer the only
-          // door onto a fresh session, so the brief lives at the door rather
+          // successful start (see agent-process): this path is not the only
+          // door onto a new session, so the brief lives at the door rather
           // than at each caller.
           await startAgentProcess(t.agentName!, { fresh: true })
           agentLastRestart.set(t.agentName!, Date.now())
@@ -3159,7 +3333,9 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     }
   }
   setTimeout(() => { void check() }, 30000)
-  return setInterval(() => { void check() }, 60000)
+  // KILLSWITCH1022: this tick also revives desired-but-missing agents
+  // (reconcileDesiredAgents), which a stopped fleet must not do.
+  return setInterval(whileNotFrozen('channel-monitor', () => { void check() }), 60000)
 }
 
 // Start desired-but-missing agents one at a time. The stagger is mandatory:

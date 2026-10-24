@@ -21,9 +21,11 @@ outgoing-copy-gate.py (behavior-neutral; parity proven byte-for-byte against a
 golden captured from the pre-move code -- scripts/__tests__/email-extract-parity.test.py).
 """
 import hashlib
+import html
 import json
 import os
 import re
+import subprocess
 
 def collect_bash_body(cmd: str):
     """Return (text, unreadable_reason). text is '' when nothing was recovered."""
@@ -250,7 +252,218 @@ def collect_bash_attachments(cmd: str):
 
 # The claude.ai Gmail connector's send-shaped tools (mcp__claude_ai_Gmail__*):
 # no "send_email" in the name, so the name-based test above never saw them.
+# Kept for importers; the gates classify with classify_mail_tool below, which
+# matches every name this pattern matches.
 CONNECTOR_SEND_RE = re.compile(r"gmail__(reply|reply_all|send_message|forward)$", re.I)
+
+
+# --- tool-name classification -------------------------------------------------
+# ONE classifier for the main agent's mail gates (email-approval-gate.py,
+# outgoing-copy-gate.py, credential-gate.py) and, as a JS twin, for the
+# sub-agent gate (scripts/email-send-gate.mjs classifyMailTool). Both copies
+# are bound by the shared case list scripts/hooks/mail-tool-name-cases.json,
+# which src/__tests__/email-gate-matcher-drift.test.ts runs through both.
+#
+# Why the base-name SUFFIX: vendor/gmail-mcp-fork prepends its tool prefix
+# (--tool-prefix / GMAIL_MCP_TOOL_PREFIX) to every tool name VERBATIM, with no
+# separator guaranteed ("v2_", "v2", "work-", ...). The patterns the gates
+# carried described what stands BEFORE the base name (`gmail__reply_all$`,
+# `(^|__)draft_email$`, `(^|__)manage_email$`), so every prefixed name slipped
+# past them: mcp__gmail__v2_reply_all was not a send for any gate, and
+# mcp__gmail__v2_draft_email skipped the sub-agent recipient ledger. A verbatim
+# prefix leaves exactly one invariant intact, that the base name is the END of
+# the tool name, so the test is endswith(base) and nothing is assumed about
+# what precedes it. The same holds for the server segment: reply_all and
+# send_draft are sends on a server of any name (the vendored server registered
+# as server-gmail-autoauth-mcp never matched `gmail__reply_all$`).
+#
+# The classifier covers every name the patterns it replaces matched:
+#   - send_email and the three draft names keep the SUBSTRING match the
+#     widest of the old gates used;
+#   - manage_email is the suffix: a prefixed mcp__x__v2_manage_email is the
+#     multiplexer, a look-alike such as manage_emails_bulk is not (the
+#     sub-agent gate's pinned rule). The approval gate, whose scope always
+#     matched the substring, keeps that on top (its scope_kind);
+#   - `gmail__(reply|reply_all|send_message|forward)$` implies "gmail" in the
+#     name plus the suffix, which is what the connector test checks;
+#   - the generic words send_message / reply / forward count only with "gmail"
+#     somewhere in the qualified name, because the Telegram plugin's tool is
+#     `..._telegram__reply` and the mail gates must never fire on it;
+#   - send_gmail_message / draft_gmail_message (the Google Workspace MCP's
+#     Gmail send and draft tools) carry neither "send_email" nor a known
+#     draft name, so they are matched by name (substring) as send_email and
+#     draft kinds;
+#   - send_draft is NEW: it sends an existing draft by draftId and no gate knew
+#     it. The vendored server ships it next to draft_email, so a sub-agent
+#     could draft (ledger-checked) and then send the draft with no gate at all.
+#   - send_mail / send_mail_auto (the harder-mail MCP's sends) are suffixes too
+#     (HARDERMAILGATES1019): measured 2026-10-19, no gate saw them. They are
+#     connector_send, not send_email: a reply names the original message
+#     (reply_to_uid + reply_folder) instead of a `to`, as a connector reply does
+#     by messageId, and the sub-agent gate's thread-reply narrowing reads
+#     send_email-shaped Gmail fields, which must never release these. Its
+#     create_draft is a draft by the substring rule above.
+# A read tool whose name happens to END in a send-shaped base is classified as
+# a send: that false positive fails closed, the direction a mail gate may err
+# in. lowercase + endswith/in, no regex, so the two copies cannot drift on
+# `$`-before-newline semantics.
+_CONNECTOR_GENERIC_SUFFIXES = ("send_message", "reply", "forward")
+_DRAFT_NAMES = ("draft_email", "create_draft", "update_draft", "draft_gmail_message")
+_MAILBOX_SEND_SUFFIXES = ("send_mail", "send_mail_auto")
+
+# Kinds (the same vocabulary as classifyMailTool in email-send-gate.mjs):
+#   "send_email"     address-carrying direct send (to/cc/bcc fields)
+#   "connector_send" reply_all, or a Gmail send_message / reply / forward
+#                    (often addressed by messageId), or a send_mail /
+#                    send_mail_auto (a reply addressed by reply_to_uid)
+#   "send_draft"     sends an existing draft by draftId: no envelope visible
+#   "manage_email"   the multiplexer: the operation decides
+#   "draft"          writes a draft (draft_email / create_draft / update_draft)
+#   None             not an outbound mail tool (reads, search, labels, delete)
+MAIL_TOOL_KINDS = ("send_email", "connector_send", "send_draft", "manage_email", "draft")
+
+
+def classify_mail_tool(tool_name):
+    """Classify a (possibly prefixed, qualified) tool name. Strictest kind
+    first, so a name that fits two kinds lands in the one that gates harder."""
+    n = str(tool_name or "").lower()
+    if not n or n == "bash":
+        return None
+    if "send_email" in n or "send_gmail_message" in n:
+        return "send_email"
+    if n.endswith("reply_all"):
+        return "connector_send"
+    if "gmail" in n and n.endswith(_CONNECTOR_GENERIC_SUFFIXES):
+        return "connector_send"
+    if n.endswith(_MAILBOX_SEND_SUFFIXES):
+        return "connector_send"
+    if n.endswith("send_draft"):
+        return "send_draft"
+    if n.endswith("manage_email"):
+        return "manage_email"
+    if any(d in n for d in _DRAFT_NAMES):
+        return "draft"
+    return None
+
+
+# --- harder-mail letters (HARDERMAILGATES1019) --------------------------------
+# What a harder-mail call carries beyond the shared to/cc/subject/body: the
+# account it sends from, a reply's original (reply_to_uid + reply_folder, the
+# server resolves the recipient from it, so a reply may carry no `to`), and a
+# body_format. The classifier above decides THAT these tools are gated; the
+# helpers below only read their letter.
+HARDER_RENDERED_FORMATS = ("markdown", "html")
+_HARDER_RENDER_TIMEOUT_S = 8
+# The input fields the send anchor covers. Any other field (an attachment)
+# changes the letter without changing the anchor, so its presence is
+# fail-closed until the anchor learns it.
+HARDER_SEND_FIELDS = frozenset(
+    {"account", "to", "cc", "subject", "body", "reply_to_uid", "reply_folder", "body_format"})
+
+
+def is_harder_mail_tool(tool_name) -> bool:
+    """A harder-mail letter tool: a send by its suffix, or any tool of the
+    harder-mail server (its create_draft is a generic name another MCP may
+    carry, so the draft is recognised by the server segment)."""
+    n = str(tool_name or "").lower()
+    return n.endswith(_MAILBOX_SEND_SUFFIXES) or "__harder-mail__" in n or "__harder_mail__" in n
+
+
+def _harder_mail_python():
+    """The python of the harder-mail server's venv: HARDER_MAIL_PYTHON, else the
+    `command` of the harder-mail MCP entry in this session's Claude config
+    ($CLAUDE_CONFIG_DIR/.claude.json, else ~/.claude.json). None if not found."""
+    explicit = os.environ.get("HARDER_MAIL_PYTHON", "").strip()
+    if explicit:
+        return explicit
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    try:
+        with open(os.path.join(base, ".claude.json"), encoding="utf-8") as fh:
+            entry = (json.load(fh).get("mcpServers") or {}).get("harder-mail") or {}
+    except (OSError, ValueError):
+        return None
+    command = entry.get("command")
+    return command if isinstance(command, str) and command else None
+
+
+def collect_harder_mail_text(tool_input: dict):
+    """(text, unreadable_reason) for a harder-mail draft/send carrying body_format
+    markdown/html (design 6.3a): the TEXT the server puts in the plain part, from
+    the server's own `python -m harder_mail_mcp.render`, plus the subject. The raw
+    markup is never audited instead: a tag inside a word ("k<b>uldom</b>") splits
+    it for the accent check, so the raw text can pass what the reader sees.
+    Render missing, failing or rejecting -> unreadable (fail-closed)."""
+    fmt = str(tool_input.get("body_format") or "plain")
+    if fmt == "plain":
+        return collect_mcp_body(tool_input), None
+    if fmt not in HARDER_RENDERED_FORMATS:
+        return "", f"ismeretlen body_format ({fmt[:20]!r}) -- csak plain, markdown vagy html lehet"
+    python = _harder_mail_python()
+    if not python:
+        return "", ("a harder-mail render nem talalhato (HARDER_MAIL_PYTHON vagy a .claude.json "
+                    "harder-mail bejegyzese kell), a formazott level szovege igy nem vizsgalhato")
+    if not os.path.isabs(python):
+        return "", (f"a harder-mail render interpretere nem abszolut utvonal ({python[:80]!r}) -- "
+                    "PATH-bol feloldott python mas modult futtathatna")
+    # Security review: `-m` puts the cwd on sys.path, and the hook runs in the
+    # agent's working dir -- a harder_mail_mcp/render.py planted there would answer
+    # "clean" for the real one (measured). -I keeps cwd, PYTHON* env and the user
+    # site off the path; the fixed cwd is belt and braces.
+    try:
+        proc = subprocess.run([python, "-I", "-m", "harder_mail_mcp.render", "--format", fmt],
+                              input=str(tool_input.get("body") or ""), capture_output=True,
+                              text=True, timeout=_HARDER_RENDER_TIMEOUT_S,
+                              cwd=os.path.dirname(python) or "/")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", f"a harder-mail render nem futtathato ({type(exc).__name__})"
+    if proc.returncode == 1:
+        return "", "a harder-mail render elutasitotta a levelet: " + proc.stderr.strip()[:600]
+    if proc.returncode != 0:
+        return "", f"a harder-mail render hibaval lepett ki (rc={proc.returncode})"
+    try:
+        text = str(json.loads(proc.stdout)["text"])
+    except (ValueError, KeyError, TypeError):
+        return "", "a harder-mail render kimenete nem ertelmezheto"
+    subject = str(tool_input.get("subject") or "")
+    # The floor (security review): the interpreter comes from config the agent
+    # can write, so a stand-in render could answer "clean". The raw body, its
+    # tags stripped and entities decoded here, is audited too, so the audit is
+    # never weaker than a deterministic local reading of the same letter.
+    floor = _strip_markup(str(tool_input.get("body") or ""))
+    return "\n".join(part for part in (text, floor, subject) if part), None
+
+
+_BLOCK_TAG = re.compile(r"</?(p|div|br|li|ul|ol|h[1-6]|tr|td|th|table|blockquote)\b[^>]*>", re.I)
+
+
+def _strip_markup(body: str) -> str:
+    """Tags out (a block tag is a line break, an inline tag joins its word, so
+    "k<b>uldom</b>" reads "kuldom"), entities decoded."""
+    return html.unescape(re.sub(r"<[^>]*>", "", _BLOCK_TAG.sub("\n", body)))
+
+
+def _harder_send_envelope(ti: dict, to: list, reason):
+    """(to, reason, extra) for a harder-mail send: the reply's original is the
+    recipient anchor when there is no `to`, and the account, a non-plain
+    body_format and the original join the anchor (extra)."""
+    extra = {}
+    unknown = sorted(k for k, v in ti.items() if k not in HARDER_SEND_FIELDS and v not in (None, ""))
+    if unknown:
+        reason = (f"a hivasban a horgony altal nem fedett mezo van ({', '.join(unknown)}) -- "
+                  "egy ilyen mezo a levelet a horgony valtozasa nelkul valtoztatna meg")
+    if ti.get("account"):
+        extra["account"] = str(ti["account"])
+    # Design 6.3b: the same body as plain, markdown or html is three different
+    # letters. Only a non-plain format joins the anchor, so a plain letter's
+    # anchor (with or without an explicit body_format="plain") stays unchanged.
+    if ti.get("body_format") not in (None, "", "plain"):
+        extra["body_format"] = str(ti["body_format"])
+    if ti.get("reply_to_uid") not in (None, ""):
+        # Structured, not ':'-joined: a ':' in the folder must not collide with a uid.
+        extra["reply_to"] = [str(ti.get("reply_folder") or ""), str(ti["reply_to_uid"])]
+        if not to:
+            to = ["reply_to:" + json.dumps(extra["reply_to"], ensure_ascii=False)]
+    return to, reason, extra
 
 
 def collect_email_envelope(tool_name: str, tool_input: dict):
@@ -261,8 +474,9 @@ def collect_email_envelope(tool_name: str, tool_input: dict):
     also carries "html_sha256" and "attachments" when the command names them
     (EMAILHTMLHORGONY929). The CALLER decides policy
     (e.g. an empty recipient list on a send is itself grounds to deny)."""
-    html_sha256, attachments = None, []
-    if re.search(r"send_email", tool_name or "", re.I) or CONNECTOR_SEND_RE.search(tool_name or ""):
+    html_sha256, attachments, harder = None, [], {}
+    # A prefixed name (mcp__gmail__v2_reply_all) is extracted like the bare one.
+    if classify_mail_tool(tool_name) in ("send_email", "connector_send"):
         ti = tool_input if isinstance(tool_input, dict) else {}
         text = collect_mcp_body(ti)
         to, cc, bcc, reason = collect_mcp_recipients(ti)
@@ -272,6 +486,8 @@ def collect_email_envelope(tool_name: str, tool_input: dict):
         # the addresses: an approval for one message cannot answer another.
         if not to and ti.get("messageId"):
             to = [f"messageId:{ti['messageId']}"]
+        if is_harder_mail_tool(tool_name):
+            to, reason, harder = _harder_send_envelope(ti, to, reason)
     elif tool_name == "Bash":
         cmd = str((tool_input or {}).get("command") or "") if isinstance(tool_input, dict) else ""
         text, reason = collect_bash_body(cmd)
@@ -289,4 +505,5 @@ def collect_email_envelope(tool_name: str, tool_input: dict):
         env["html_sha256"] = html_sha256
     if attachments:
         env["attachments"] = attachments
+    env.update(harder)
     return env

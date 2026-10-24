@@ -18,6 +18,7 @@ import { createAgentMessage, hasOpenInboundQuestion } from '../db.js'
 import { readContextGuardConfig } from './context-guard-store.js'
 import { getHardGuardPhase } from './context-guard-runner.js'
 import { dailyHandoffArmed } from '../context-guard.js'
+import { whileNotFrozen } from './fleet-freeze.js'
 
 // Drives per-agent scheduled restarts (see src/auto-restart.ts for the why and
 // the pure due-logic). Mirrors the other watcher loops: a 60s sweep, started
@@ -90,6 +91,10 @@ function paneIsIdle(session: string, host: string | null): boolean {
 // symptom was invisible: a log line nobody reads, while the dashboard showed
 // auto-restart as enabled and correctly scheduled.
 function restartMainChannelsSession(): void {
+  if (process.env.MARVEEN_AGENT_BACKEND === 'codex') {
+    respawnMainSessionFresh()
+    return
+  }
   if (mainRestartMechanism(existsSync('/bin/launchctl')) === 'launchd') {
     const uid = typeof process.getuid === 'function' ? process.getuid() : ''
     // Label keys off SERVICE_ID (defaults to MAIN_AGENT_ID) so it matches the
@@ -300,5 +305,5 @@ export function startAutoRestartRunner(): NodeJS.Timeout {
     }
   }
   setTimeout(sweep, INITIAL_DELAY_MS)
-  return setInterval(sweep, INTERVAL_MS)
+  return setInterval(whileNotFrozen('auto-restart', sweep), INTERVAL_MS)
 }

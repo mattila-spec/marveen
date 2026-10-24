@@ -40,7 +40,7 @@ function stageTree(scriptNames: string[]): { root: string; bin: string } {
   const bin = join(stage, 'bin')
   mkdirSync(bin, { recursive: true })
   writeFileSync(join(bin, 'curl'),
-    '#!/bin/bash\necho "$@" >> "${CURL_ARGV_LOG:-/dev/null}"\nif [ "${CURL_STUB_EXIT:-0}" -ne 0 ]; then\n  echo "curl: (6) Could not resolve host for https://api.telegram.org/bot${CURL_STUB_TOKEN:-}/sendMessage" >&2\n  exit "${CURL_STUB_EXIT}"\nfi\nprintf \'%s\' "${CURL_STUB_BODY:-{\\"ok\\":true}}"\n')
+    '#!/bin/bash\necho "$@" >> "${CURL_ARGV_LOG:-/dev/null}"\ncat >> "${CURL_STDIN_LOG:-/dev/null}"\nif [ "${CURL_STUB_EXIT:-0}" -ne 0 ]; then\n  echo "curl: (6) Could not resolve host for https://api.telegram.org/bot${CURL_STUB_TOKEN:-}/sendMessage" >&2\n  exit "${CURL_STUB_EXIT}"\nfi\nprintf \'%s\' "${CURL_STUB_BODY:-{\\"ok\\":true}}"\n')
   writeFileSync(join(bin, 'tmux'), '#!/bin/bash\nexit 1\n')
   // limit-monitor hashes with md5sum, which macOS lacks (md5 only); the hash
   // value is irrelevant to these tests, only the stamp lifecycle is.
@@ -56,6 +56,7 @@ function runScript(rel: string, args: string[], env: Record<string, string>, bin
       HOME: stage,
       CURL_STUB_TOKEN: FAKE_TOKEN,
       CURL_ARGV_LOG: join(stage, 'curl-argv.log'),
+      CURL_STDIN_LOG: join(stage, 'curl-stdin.log'),
       ...env,
     },
     encoding: 'utf-8',
@@ -196,7 +197,7 @@ describe('host-restart-watchdog.sh: one-shot notice retries until delivered', ()
 
 // ---- disk-space-guard.sh ---------------------------------------------------
 
-describe('disk-space-guard.sh: cooldown stamp only after confirmed delivery', () => {
+describe('disk-space-guard.sh: local-only alerts never call an external provider', () => {
   const setup = () => {
     const { bin } = stageTree(['disk-space-guard.sh'])
     writeFileSync(join(stage, '.env'), 'ALLOWED_CHAT_ID=42\n')
@@ -211,20 +212,22 @@ describe('disk-space-guard.sh: cooldown stamp only after confirmed delivery', ()
     }
     return { bin, env, stamp: join(stage, 'store', '.disk-guard-alerted') }
   }
-  it('an ok:false rejection no longer logs "owner alerted" and does NOT start the 1h cooldown', () => {
+  it('ignores provider stubs, records the local alert cooldown, and never claims external delivery', () => {
     const { bin, env, stamp } = setup()
     const r = runScript('disk-space-guard.sh', [], { ...env, CURL_STUB_BODY: '{"ok":false,"error_code":400,"description":"chat not found"}' }, bin)
     expect(r.status).toBe(0)
-    // RED-BEFORE: the old script logged "owner alerted via direct Bot API"
-    // on exactly this input and stamped the cooldown.
-    expect(existsSync(stamp)).toBe(false)
+    expect(existsSync(stamp)).toBe(true)
+    expect(curlWasInvoked()).toBe(false)
+    expect(r.stdout + r.stderr).toContain('ALERT local-only')
     expect(r.stdout + r.stderr).not.toContain('owner alerted')
   })
-  it('confirmed delivery stamps the cooldown', () => {
+  it('the local-only alert reports read-only behavior and stamps the cooldown', () => {
     const { bin, env, stamp } = setup()
     const r = runScript('disk-space-guard.sh', [], env, bin)
     expect(r.status).toBe(0)
     expect(existsSync(stamp)).toBe(true)
-    expect(r.stdout + r.stderr).toContain('delivery confirmed')
+    expect(curlWasInvoked()).toBe(false)
+    expect(r.stdout + r.stderr).toContain('ALERT local-only')
+    expect(r.stdout + r.stderr).toContain('no files were changed')
   })
 })
