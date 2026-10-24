@@ -2274,8 +2274,8 @@ export async function startAgentProcess(name: string, opts: StartOpts = {}): Pro
     // without hardcoding agent names.
     const profile = loadProfileTemplate(resolveAgentSecurityProfile(name))
     writeAgentSettingsFromProfile(name, profile)
-    ensureFleetRosterSection(name)
     ensureOwnerOperatingRulesSection(name)
+    ensureFleetRosterSection(name)
     ensureProjectRootInClaudeMd(name)
     ensureAutonomySection(name)
     ensureSkillsPathTrapSection(name)
