@@ -50,6 +50,41 @@ const dashboardOrigin = resolveDashboardOrigin(DASHBOARD_PUBLIC_URL, WEB_PORT, A
 // and every call 401s silently. Measured 2026-07-25: relative 401, absolute
 // 200; this had been silently killing sub-agent memory saves and searches.
 const tokenPath = join(PROJECT_ROOT, 'store', '.dashboard-token')
+const OWNER_RULES_BEGIN = '<!-- BEGIN GENERATED: owner-operating-rules -->'
+const OWNER_RULES_END = '<!-- END GENERATED: owner-operating-rules -->'
+const OWNER_RULES_BLOCK_RE = /<!-- BEGIN GENERATED: owner-operating-rules -->[\s\S]*?<!-- END GENERATED: owner-operating-rules -->/g
+
+// AGENTS.md is the single approved source for owner-wide standing rules.
+// Inject it into every Claude-backed agent at launch, including the main agent,
+// so new and existing agent prompts stay synchronized with the approved source.
+export function ensureOwnerOperatingRulesSection(
+  name: string,
+  paths: { projectRoot?: string; agentsBaseDir?: string } = {},
+): void {
+  const projectRoot = paths.projectRoot ?? PROJECT_ROOT
+  const claudeMdPath = name === MAIN_AGENT_ID
+    ? join(projectRoot, 'CLAUDE.md')
+    : join(paths.agentsBaseDir ? join(paths.agentsBaseDir, name) : agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) throw new Error(`Cannot inject owner rules; agent instructions are missing: ${claudeMdPath}`)
+  const sourcePath = join(projectRoot, 'AGENTS.md')
+  if (!existsSync(sourcePath)) throw new Error(`Required owner rules are missing: ${sourcePath}`)
+  const source = readFileSync(sourcePath, 'utf8')
+  if (!source.trim()) throw new Error(`Required owner rules are empty: ${sourcePath}`)
+  if (source.includes(OWNER_RULES_BEGIN) || source.includes(OWNER_RULES_END)) throw new Error('Owner rules source contains reserved markers')
+  const block = `${OWNER_RULES_BEGIN}\n${source}${source.endsWith('\n') ? '' : '\n'}${OWNER_RULES_END}`
+  const existing = readFileSync(claudeMdPath, 'utf8')
+  const matches = [...existing.matchAll(new RegExp(OWNER_RULES_BLOCK_RE.source, 'g'))]
+  const remaining = existing.replace(new RegExp(OWNER_RULES_BLOCK_RE.source, 'g'), '')
+  if (remaining.includes(OWNER_RULES_BEGIN) || remaining.includes(OWNER_RULES_END)) throw new Error(`Malformed owner rules markers: ${claudeMdPath}`)
+  let replaced = false
+  const updated = matches.length
+    ? existing.replace(new RegExp(OWNER_RULES_BLOCK_RE.source, 'g'), () => { if (replaced) return ''; replaced = true; return block })
+    : `${existing.trimEnd()}\n\n${block}\n`
+  if (updated !== existing) atomicWriteFileSync(claudeMdPath, updated)
+  const verified = readFileSync(claudeMdPath, 'utf8')
+  const verifiedBlocks = [...verified.matchAll(new RegExp(OWNER_RULES_BLOCK_RE.source, 'g'))]
+  if (verifiedBlocks.length !== 1 || verifiedBlocks[0][0] !== block) throw new Error(`Owner rules injection verification failed for ${name}`)
+}
 
 // Hook commands run under `/bin/sh -c` with a NON-interactive PATH. On nvm
 // installs a bare `node` is not on that PATH, so the hook exits 127 -- which

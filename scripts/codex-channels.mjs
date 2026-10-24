@@ -1,3 +1,4 @@
+import { readCanonicalOwnerRules } from './lib/codex-owner-instructions.mjs'
 /** ChatGPT-backed channel host. Reuses the installed Telegram MCP plugin,
  * including its pairing, allowlists, attachment handling and reply tools. */
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, chmodSync, unlinkSync } from 'node:fs'
@@ -91,8 +92,9 @@ function mcpConfig(internal = false) {
 function instructions(internal = false) {
   if (bridgeTest && process.argv.includes('--escalation-test')) return economyInstructions + '\nTest: on Luna request a stronger model for this complex debugging test. On Sol call telegram_reply with chat_id synthetic-chat-fixture and text CODEX_BRIDGE_OK. Do not use other tools.'
   if (bridgeTest) return 'Call telegram_reply with chat_id synthetic-chat-fixture and text CODEX_BRIDGE_OK. Do not use other tools.'
+  const ownerRules = readCanonicalOwnerRules(root)
   const files = ['CLAUDE.md', 'SOUL.md'].filter(f => existsSync(join(root, f)))
-  return files.map(f => readFileSync(join(root, f), 'utf8')).join('\n\n') + `
+  return ownerRules + '\n\n' + files.map(f => readFileSync(join(root, f), 'utf8')).join('\n\n') + `
 Runtime: You are Marveen running through Codex with the owner's ChatGPT account.
 Claude-specific CLI commands and hooks do not apply to this runtime.
 User messages arrive as JSON with trusted routing metadata and a message field.
