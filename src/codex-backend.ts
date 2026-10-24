@@ -96,6 +96,6 @@ export function runCodexWorker(message: string, cwd: string, timeoutMs: number, 
       if (code !== 0) return resolve({text: null, error: 'Codex worker failed; check ChatGPT login and quota'})
       try { resolve(JSON.parse(output)) } catch { resolve({text: null, error: 'Invalid Codex worker response'}) }
     })
-    child.stdin.end(JSON.stringify({ message, cwd, allowTools }))
+    child.stdin.end(JSON.stringify({ message, cwd, allowTools, ownerRulesRoot: PROJECT_ROOT }))
   })
 }

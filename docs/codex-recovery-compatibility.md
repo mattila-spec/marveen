@@ -4,6 +4,12 @@ The owner's approved operating rules remain in AGENTS.md without text changes.
 This follow-up preserves the installed main-channel incident budget on the
 Codex-capable release candidate. It does not switch the main backend to Claude.
 
+Dashboard Codex workers receive the trusted project rule root separately from
+their working directory. Heartbeat and digest sandboxes retain their isolated
+cwd while loading the canonical project source; a missing project source fails
+closed even if the sandbox contains its own instruction file. Direct worker CLI
+calls still use their provided cwd when no explicit project source is supplied.
+
 ## Recovery ownership
 
 The Python gate serializes claims across processes using one `main-channels`

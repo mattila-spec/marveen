@@ -110,9 +110,35 @@ describe('worker cwd and dashboard startup gate', () => {
   })
 })
 
+describe('dashboard worker project source and sandbox isolation', () => {
+  it('forwards the trusted rule root without changing the worker cwd', async () => {
+    const f = fixture(); const cwd = join(f.root, 'agents', 'neutral-worker')
+    const source = readFileSync(join(PROJECT_ROOT, 'src/codex-backend.ts'), 'utf8')
+    const ast = ts.createSourceFile('backend.ts', source, ts.ScriptTarget.Latest, true)
+    const fn = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'runCodexWorker')!
+    const js = ts.transpileModule('(' + fn.getText(ast).replace('export ', '') + ')', {
+      compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS},
+    }).outputText
+    const handlers: Record<string, (...args: any[]) => void> = {}
+    let payload: Record<string, unknown> = {}
+    const child = {
+      stdin:{on:vi.fn(),end:(raw:string)=>{payload=JSON.parse(raw);handlers.data(Buffer.from('{"text":"fixture-result"}'));handlers.exit(0)}},
+      stdout:{on:(event:string,callback:(...args:any[])=>void)=>{handlers[event]=callback}},
+      on:(event:string,callback:(...args:any[])=>void)=>{handlers[event]=callback},kill:vi.fn(),
+    }
+    const spawn = vi.fn((..._args: any[])=>child)
+    const run = runInNewContext(js,{spawn,join,PROJECT_ROOT:f.root,process,setTimeout,clearTimeout})
+    expect(await run('fixture',cwd,1000,false)).toEqual({text:'fixture-result'})
+    expect(payload).toMatchObject({cwd,ownerRulesRoot:f.root,allowTools:false})
+    expect(spawn.mock.calls[0][2].cwd).toBe(cwd)
+  })
+})
+
 describe('real worker entrypoint over a local fake app-server', () => {
-  it.each([false, true])('passes the canonical rules to thread/start, tools=%s', allowTools => {
+  it.each([{allowTools:false, isolated:false}, {allowTools:true, isolated:false}, {allowTools:false, isolated:true}, {allowTools:true, isolated:true}])('passes canonical rules with independent working directory: %j', ({allowTools, isolated}) => {
     const f = fixture()
+    const cwd = isolated ? join(f.root, 'agents', 'neutral-worker') : f.root
+    mkdirSync(cwd, { recursive: true })
     const capture = join(f.root, 'thread.json')
     const fake = join(f.root, 'fake-codex')
     writeFileSync(fake, `#!/usr/bin/env node
@@ -134,15 +160,28 @@ lines.on('line', line => {
 });
 `, { mode: 0o755 })
     const out = spawnSync(process.execPath, [join(PROJECT_ROOT, 'scripts/codex-worker.mjs')], {
-      cwd: f.root, input: JSON.stringify({ message: 'fixture', cwd: f.root, allowTools }),
+      cwd, input: JSON.stringify({ message: 'fixture', cwd, allowTools, ...(isolated ? {ownerRulesRoot:f.root} : {}) }),
       env: { ...process.env, MARVEEN_CODEX_BIN: fake, FIXTURE_CAPTURE: capture }, encoding: 'utf8', timeout: 10000,
     })
     expect(out.status, out.stderr).toBe(0)
     expect(JSON.parse(out.stdout).text).toBe('fixture-result')
     const thread = JSON.parse(readFileSync(capture, 'utf8'))
-    expect(thread.cwd).toBe(f.root)
+    expect(thread.cwd).toBe(cwd)
     expect(thread.developerInstructions.startsWith(rules + '\n\n')).toBe(true)
     expect(thread.sandbox).toBe(allowTools ? 'workspace-write' : 'read-only')
+  })
+  it('does not substitute cwd instructions when the trusted project source is missing', () => {
+    const f = fixture()
+    const cwd = join(f.root, 'agents', 'neutral-worker'); mkdirSync(cwd, {recursive:true})
+    writeFileSync(join(cwd, 'AGENTS.md'), 'Unapproved workspace instructions')
+    rmSync(join(f.root, 'AGENTS.md'))
+    const out = spawnSync(process.execPath, [join(PROJECT_ROOT, 'scripts/codex-worker.mjs')], {
+      cwd, input: JSON.stringify({message:'fixture',cwd,allowTools:false,ownerRulesRoot:f.root}),
+      env:{...process.env,MARVEEN_CODEX_BIN:join(f.root,'must-not-start')},encoding:'utf8',timeout:10000,
+    })
+    expect(out.status).not.toBe(0)
+    expect(out.stderr).toContain('Required owner rules')
+    expect(out.stderr).not.toContain('must-not-start')
   })
   it('fails before spawning app-server when AGENTS.md is missing', () => {
     const f = fixture(); rmSync(join(f.root, 'AGENTS.md'))

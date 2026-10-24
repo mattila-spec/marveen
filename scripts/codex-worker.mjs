@@ -6,8 +6,8 @@ import { DEFAULT_MODEL, escalationTool, economyInstructions, EconomySession } fr
 
 let input = ''
 for await (const chunk of process.stdin) input += chunk
-const { message, cwd, allowTools } = JSON.parse(input)
-const developerInstructions = workerDeveloperInstructions(cwd, allowTools, economyInstructions)
+const { message, cwd, allowTools, ownerRulesRoot } = JSON.parse(input)
+const developerInstructions = workerDeveloperInstructions(ownerRulesRoot ?? cwd, allowTools, economyInstructions)
 const bin = process.env.MARVEEN_CODEX_BIN ?? join(homedir(), '.local/lib/marveen-codex/node_modules/.bin/codex')
 const rpc = new JsonRpcProcess(bin, ['app-server', '-c', 'forced_login_method="chatgpt"'], {cwd, detached: process.platform !== 'win32'})
 process.on('SIGTERM', () => { rpc.close(); process.exit(1) })
