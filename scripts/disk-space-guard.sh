@@ -5,32 +5,30 @@
 # 2.2G orphaned /tmp/health_* Apple Health export (the apple-health skill's
 # scratch cleanup didn't run). A full root wedged the main session in a /mcp
 # modal and every disk-touching watchdog gave false signals. This guard is the
-# independent net: it reaps known-safe scratch BEFORE the disk fills, and when it
-# can't recover it alerts the owner over the DIRECT Telegram Bot API (the in-session
-# MCP plugin is dead under disk-full).
+# independent net: it measures capacity and reports possible scratch candidates.
+# It never deletes files and never sends an automatic external notification.
 #
 # Determinism + safety:
 #   - Thresholds are constants at the top.
-#   - Reaping is restricted to an explicit allowlist of scratch globs AND an age
-#     guard, so a CURRENTLY-RUNNING export (recent mtime) is never deleted -- only
-#     orphans are reaped. Never recurses outside the scratch dir.
-#   - Alerts go via direct Bot API (token from channels/.env), never via MCP.
+#   - Candidate reporting is restricted to an explicit allowlist of scratch
+#     globs AND an age guard. Reporting is not authorization to delete.
+#   - Critical alerts are local-only; external sending requires separate approval.
 #   - Every stamp/log write is best-effort: under ENOSPC a failed write must not
 #     wedge or crash the guard (that is the whole point).
 #
 # Test hooks (env, used only by scripts/__tests__/disk-space-guard.test.sh):
 #   DISK_GUARD_USAGE_OVERRIDE   - use this usage% instead of df (integer)
-#   DISK_GUARD_SCRATCH_DIR      - reap base dir (default /tmp)
+#   DISK_GUARD_SCRATCH_DIR      - candidate scan base dir (default /tmp)
 #   DISK_GUARD_STATE_DIR        - cooldown-stamp dir (default <install>/store)
 #   DISK_GUARD_REAP_MIN_AGE_MIN - override the reap age guard (minutes)
-#   DISK_GUARD_ALERT_DRYRUN     - if 1, print "ALERT_DRYRUN: <msg>" not curl
+#   DISK_GUARD_ALERT_DRYRUN     - legacy test hook; all alerts are local-only
 
 set -u
 
 # --- thresholds (tunable constants) ---
 DISK_PATH="/"
-REAP_THRESHOLD=90        # >= this %: reap safe scratch
-ALERT_THRESHOLD=95       # >= this % (after reap): alert the owner directly
+REAP_THRESHOLD=90        # >= this %: inventory safe scratch candidates
+ALERT_THRESHOLD=95       # >= this %: emit a local alert for manual review
 REAP_MIN_AGE_MIN="${DISK_GUARD_REAP_MIN_AGE_MIN:-30}"   # only reap orphans older than this
 # Numeric-validate the age guard BEFORE use: a malformed env (e.g. "abc", "-1")
 # OR literal 0 must NOT degrade into "reap everything" (-mmin +0 matches an
@@ -38,10 +36,10 @@ REAP_MIN_AGE_MIN="${DISK_GUARD_REAP_MIN_AGE_MIN:-30}"   # only reap orphans olde
 case "$REAP_MIN_AGE_MIN" in (''|0|*[!0-9]*) REAP_MIN_AGE_MIN=1440;; esac
 ALERT_COOLDOWN=3600      # at most one disk-full alert per hour
 
-# Explicit allowlist of scratch globs reaped under SCRATCH_DIR (maxdepth 1).
+# Explicit allowlist of scratch globs reported under SCRATCH_DIR (maxdepth 1).
 # Space-separated env override DISK_GUARD_REAP_GLOBS; the default targets the
 # apple-health analysis scratch that caused the original incident. Extend
-# deliberately -- every entry here is `rm -rf`-able once age-guarded.
+# deliberately. An allowlist match never permits automatic deletion.
 if [ -n "${DISK_GUARD_REAP_GLOBS:-}" ]; then
   read -r -a REAP_GLOBS <<< "$DISK_GUARD_REAP_GLOBS"
 else
@@ -62,8 +60,6 @@ fi
 TG_ENV="$TG_CHAN_DIR/.env"
 LOG_TAG="disk-space-guard"
 
-. "$(cd "$(dirname "$0")" && pwd)/lib/owner-chat.sh"
-
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$LOG_TAG] $*" || true; }
 
 # Current usage% of DISK_PATH (0-100), or the test override.
@@ -74,92 +70,41 @@ disk_usage() {
   df -P "$DISK_PATH" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}'
 }
 
-# Reap age-guarded scratch matching the allowlist. Prints how many entries it
-# removed. Defensive: only operates strictly under SCRATCH_DIR, maxdepth 1, and
-# only on entries matching an allowlisted glob older than REAP_MIN_AGE_MIN.
-reap_scratch() {
-  local glob removed=0 path real
-  [ -d "$SCRATCH_DIR" ] || { echo 0; return; }
-  # HARD location guard: reaping is only ever allowed inside the system scratch
-  # tree. Resolve symlinks and require the REAL path to be /tmp or
-  # $XDG_RUNTIME_DIR (or a dir directly beneath them); refuse a symlinked
-  # SCRATCH_DIR outright. A misconfigured/hostile DISK_GUARD_SCRATCH_DIR can then
-  # never aim the reaper at real data.
-  [ -L "$SCRATCH_DIR" ] && { echo 0; return; }
-  # realpath is not on every host -> fall back to readlink -f, then `cd && pwd -P`.
+# Read-only inventory of old allowlisted scratch candidates. Candidate paths
+# are quoted in the log and categorized; no file content is opened or changed.
+list_scratch_candidates() {
+  local glob path real size risk
+  [ -d "$SCRATCH_DIR" ] || return 0
+  [ -L "$SCRATCH_DIR" ] && { log "candidate scan skipped: scratch path is a symlink"; return 0; }
   real="$(realpath "$SCRATCH_DIR" 2>/dev/null \
         || readlink -f "$SCRATCH_DIR" 2>/dev/null \
         || (cd "$SCRATCH_DIR" 2>/dev/null && pwd -P))"
-  [ -z "$real" ] && { echo 0; return; }
   case "$real/" in
-    /tmp/*) : ;;
-    # SHTEST807: on macOS /tmp is a symlink to /private/tmp, so every resolved
-    # scratch path starts with /private/tmp and the /tmp/* arm never matches --
-    # the reaper was a silent no-op on every macOS install. /private/tmp does
-    # not exist on Linux, so this arm is inert there.
-    /private/tmp/*) : ;;
-    "${XDG_RUNTIME_DIR:-/nonexistent-xdg}"/*) : ;;
-    *) echo 0; return ;;
+    /tmp/*|/private/tmp/*|"${XDG_RUNTIME_DIR:-/nonexistent-xdg}"/*) : ;;
+    *) log "candidate scan skipped: scratch path is outside approved temp roots"; return 0 ;;
   esac
   for glob in "${REAP_GLOBS[@]}"; do
     while IFS= read -r -d '' path; do
-      # Guard: the path must live directly under SCRATCH_DIR (no traversal).
-      case "$path" in
-        "$SCRATCH_DIR"/*) : ;;
-        *) continue ;;
-      esac
-      # A directory's own mtime does NOT change when files INSIDE it are written,
-      # so a long-running export dir can look "old" by mtime while still active.
-      # Skip a matched DIRECTORY if it contains ANY file newer than the age guard.
-      if [ -d "$path" ] && [ ! -L "$path" ]; then
-        if find "$path" -type f -mmin "-$REAP_MIN_AGE_MIN" -print -quit 2>/dev/null | grep -q .; then
-          continue   # has a recently-written file -> in-progress, leave it
-        fi
+      case "$path" in "$SCRATCH_DIR"/*) : ;; *) continue ;; esac
+      if [ -d "$path" ] && [ ! -L "$path" ] && find "$path" -type f -mmin "-$REAP_MIN_AGE_MIN" -print -quit 2>/dev/null | grep -q .; then
+        risk="review: directory contains a recent file"
+      else
+        risk="low-risk candidate: old allowlisted temp data; approval still required"
       fi
-      rm -rf -- "$path" 2>/dev/null && removed=$((removed + 1)) || true
+      size="$(du -sk -- "$path" 2>/dev/null | awk '{print $1}')"
+      log "CANDIDATE risk='$risk' size_kb=${size:-unknown} path=$(printf '%q' "$path")"
     done < <(find "$SCRATCH_DIR" -maxdepth 1 -name "$glob" -mmin "+$REAP_MIN_AGE_MIN" -print0 2>/dev/null)
   done
-  echo "$removed"
 }
 
-# DIRECT-BOT-API alert (mirrors channel-watchdog.sh alert_owner). Bypasses MCP
-# because under disk-full the in-session plugin cannot send.
+# Local-only alert. External notification requires separate authorization.
 alert_owner() {
-  local msg="$1" token chat
-  if [ "${DISK_GUARD_ALERT_DRYRUN:-}" = "1" ]; then
-    echo "ALERT_DRYRUN: $msg"; return 0
-  fi
-  # Token from the channels env, never hardcoded. Owner chat id via
-  # resolve_owner_chat_id (CHATID0): the old direct ALLOWED_CHAT_ID/
-  # TELEGRAM_CHAT_ID reads let the installer's "0" placeholder through
-  # unnoticed, and skipped the access.json fallback entirely.
-  # `tr -d '\r '` strips a trailing CR (CRLF-edited .env) / stray spaces so the
-  # token doesn't corrupt the URL.
-  token="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$TG_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r ')"
-  # The resolver's reason line stays on stderr (the guard's log), not
-  # /dev/null: a skipped alert must say why (no DM entry, several DM entries,
-  # no access.json). Not captured with 2>&1 -- any stderr noise on the success
-  # path would then become part of the chat id.
-  chat="$(resolve_owner_chat_id "$INSTALL_DIR/.env")" || chat=""
-  if [ -z "$token" ] || [ -z "$chat" ]; then
-    log "ALERT (no bot token or owner chat id configured, could not Telegram): $msg"; return 1
-  fi
-  # Honest send (NOTIFYVAKSWEEP826): curl exit 0 alone is not delivery -- an
-  # HTTP 200 with {"ok":false} logged "owner alerted" here while nothing
-  # arrived. Return reflects CONFIRMED delivery so the caller's cooldown stamp
-  # can depend on it.
-  . "$(cd "$(dirname "$0")" && pwd)/lib/send-telegram.sh"
-  local send_err
-  if send_err="$(send_telegram_message "$token" "$chat" "$msg" 2>&1)"; then
-    log "owner alerted via direct Bot API (delivery confirmed)"
-    return 0
-  fi
-  log "ALERT sendMessage FAILED: ${send_err}"
-  return 1
+  log "ALERT local-only: $1"
+  return 0
 }
 
 main() {
-  local usage removed now last
+  local usage now last
   # Ensure the state dir exists UP FRONT so the cooldown stamp write below always
   # succeeds. Otherwise (missing STATE_DIR) the stamp never persists, `last` stays
   # 0 every tick, and a stuck-full disk re-alerts up to 60x/hour.
@@ -171,11 +116,10 @@ main() {
     return 0   # plenty of room
   fi
 
-  log "disk ${usage}% >= ${REAP_THRESHOLD}% -- reaping scratch under $SCRATCH_DIR"
-  removed="$(reap_scratch)"
-  log "reaped $removed scratch entr$( [ "$removed" = 1 ] && echo y || echo ies )"
+  log "disk ${usage}% >= ${REAP_THRESHOLD}% -- read-only candidate scan under $SCRATCH_DIR"
+  list_scratch_candidates
   usage="$(disk_usage)"
-  log "post-reap disk ${usage}%"
+  log "post-check disk ${usage}% (no files changed)"
 
   if [ "$usage" -ge "$ALERT_THRESHOLD" ]; then
     # Cooldown so a stuck-full disk alerts at most once/hour (best-effort stamp).
@@ -183,14 +127,8 @@ main() {
     last=0; [ -f "$ALERT_STAMP" ] && last="$(cat "$ALERT_STAMP" 2>/dev/null || echo 0)"
     case "$last" in (''|*[!0-9]*) last=0;; esac
     if [ $(( now - last )) -ge "$ALERT_COOLDOWN" ]; then
-      # Cooldown stamp ONLY on confirmed delivery: a stamp written after a
-      # failed send suppressed the retry for an hour -- exactly when a full
-      # disk was already wedging the primary channel (NOTIFYVAKSWEEP826).
-      if alert_owner "🔴 Disk space critical: ${DISK_PATH} is at ${usage}% after reaping ${removed} scratch item(s). Manual cleanup needed -- a full disk can wedge the channel session (deafness)."; then
-        echo "$now" > "$ALERT_STAMP" 2>/dev/null || true
-      else
-        log "alert not delivered -- cooldown stamp NOT written, will retry next tick"
-      fi
+      alert_owner "${DISK_PATH} is at ${usage}% after read-only scan. Manual review required; no files were changed."
+      echo "$now" > "$ALERT_STAMP" 2>/dev/null || true
     else
       log "disk ${usage}% critical but within alert cooldown ($(( now - last ))s) -- skip alert"
     fi

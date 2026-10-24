@@ -28,6 +28,15 @@ Codex RPC control messages. Its existing Claude recovery path remains budgeted.
 The systemd template owns its pre-start claim and post-start verifier; inherited
 claim IDs and supervisor ownership are checked before child startup.
 
+## Installed disk-guard policy
+
+Preserve the installed read-only disk guard as a separate compatibility change.
+It inventories old scratch candidates and records a local alert, but never
+deletes candidates or sends an external notification. Upstream automatic cleanup
+and external notification must not be reintroduced by this release. Its original
+read-only regression suite is retained; tests use temporary roots and a curl
+tripwire.
+
 ## Validation and rollout
 
 Tests must use isolated roots, fake node/tmux processes, private fixture state
