@@ -61,9 +61,11 @@ native_module_loads() {
   node -e "new (require('better-sqlite3'))(':memory:').close()" >/dev/null 2>&1
 }
 
+# Large stores can need more than 20 seconds for the startup file inventory.
+# Keep HTTP success mandatory, with a bounded 120-probe budget.
 health_ok() {
   local port="${WEB_PORT:-3420}" i=0
-  while [ "$i" -lt 20 ]; do
+  while [ "$i" -lt 120 ]; do
     if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null; then return 0; fi
     sleep 1; i=$(( i + 1 ))
   done
@@ -2003,7 +2005,7 @@ _notify() { # status
   bash "$INSTALL_DIR/scripts/notify.sh" "$msg" >/dev/null 2>&1 || true
 }
 _finish() { _write "$1" "$2" "$3" "$4"; _notify "$1"; exit "$3"; }
-_health() { local i=0; while [ "$i" -lt 20 ]; do
+_health() { local i=0; while [ "$i" -lt 120 ]; do
   curl -fsS -m 3 -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null && return 0
   sleep 1; i=$(( i + 1 )); done; return 1; }
 _restart() { "$INSTALL_DIR/scripts/stop.sh"; "$INSTALL_DIR/scripts/start.sh"; }
@@ -2109,10 +2111,13 @@ if command -v systemd-run >/dev/null 2>&1 && [ -d "$XDG_RUN" ]; then
   # setsid child still sits in its own transient scope cgroup, so detaching the
   # terminal costs nothing that the cgroup gave us.
   #
+  # The finalizer records application failure in RESULT_FILE. Do not mistake
+  # its nonzero verdict for a systemd-run launch failure and run it twice.
+  # Only failure to launch the wrapper should reach the fallback.
   # setsid is NOT hoisted out of this branch on purpose: macOS has no setsid at
   # all (measured), and this branch only runs where systemd-run exists.
   XDG_RUNTIME_DIR="$XDG_RUN" setsid systemd-run --user --scope --collect --quiet \
-    bash "$FINALIZE_SCRIPT" "${FINALIZE_ARGS[@]}" \
+    bash -c 'bash "$@"; exit 0' -- "$FINALIZE_SCRIPT" "${FINALIZE_ARGS[@]}" \
     < /dev/null >> "$FINALIZE_LOG" 2>&1 \
     || setsid bash "$FINALIZE_SCRIPT" "${FINALIZE_ARGS[@]}" < /dev/null >> "$FINALIZE_LOG" 2>&1 &
 elif command -v setsid >/dev/null 2>&1; then

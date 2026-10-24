@@ -125,3 +125,7 @@ jobs:
       # #2202: the second-reviewer hook decides whether a high-risk call goes through, so its
       # contract is a gate instrument. Hermetic: a local HTTP stand-in for the review route.
       - run: python3 scripts/__tests__/second-reviewer-gate.test.py
+      # Large-store startup budget and one-shot finalizer regression.
+      - run: python3 scripts/__tests__/update-startup-budget.test.py
+      - run: bash scripts/__tests__/update-finalize-stages.test.sh
+      - run: bash scripts/__tests__/felugyeleti-riasztas.test.sh
