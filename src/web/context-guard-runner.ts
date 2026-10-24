@@ -606,7 +606,7 @@ async function performRestart(name: string): Promise<void> {
     // (and warns + falls back to a pane respawn if the plist is absent), uses
     // respawn-pane-FRESH on Linux -- fresh is exactly what the guard wants --
     // and writes the shared respawn stamp so the other respawners defer to us.
-    const res = hardRestartMarveenChannels()
+    const res = hardRestartMarveenChannels({ automatic: true, actor: 'context-guard' })
     if (!res.ok) throw new Error(res.error ?? 'main channels hard restart failed')
   } else {
     // DANICTXHUROK906: claim the reconcile grace window BEFORE the stop, so

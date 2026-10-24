@@ -865,7 +865,7 @@ export const defaultProbeTickDeps: ProbeTickDeps = {
         const paneContent = capturePane(MAIN_CHANNELS_SESSION)
         return paneContent != null ? detectPaneState(paneContent) : null
       },
-      restart: hardRestartMarveenChannels,
+      restart: () => hardRestartMarveenChannels({ automatic: true, actor: 'inbound-probe' }),
     }
   },
   log: logger,

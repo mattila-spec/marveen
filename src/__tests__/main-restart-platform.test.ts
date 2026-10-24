@@ -62,7 +62,7 @@ function hasLaunchctlGate(code: string): boolean {
 
 // A path that restarts main WITHOUT launchd.
 function hasNonLaunchdPath(code: string): boolean {
-  return /hardRestartMarveenChannels\(\)/.test(code) || /respawnMainSessionFresh\(\)/.test(code)
+  return /hardRestartMarveenChannels\(\s*(?:\{[^}]*\}\s*)?\)/.test(code) || /respawnMainSessionFresh\(\)/.test(code)
 }
 
 describe('main-session restart is platform-correct (2026-07-26 launchctl ENOENT)', () => {
@@ -88,7 +88,7 @@ describe('main-session restart is platform-correct (2026-07-26 launchctl ENOENT)
         // returns void and warns internally, so there is no result to check
         // (a real remaining gap, called out in the PR rather than papered over).
         const code = stripComments(read(rel))
-        if (/hardRestartMarveenChannels\(\)/.test(code)) {
+        if (/hardRestartMarveenChannels\(\s*(?:\{[^}]*\}\s*)?\)/.test(code)) {
           expect(code).toMatch(/if\s*\(\s*!\s*res\.ok\s*\)\s*throw/)
         }
       })

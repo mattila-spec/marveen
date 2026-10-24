@@ -86,6 +86,10 @@ vi.mock('../web/agent-scaffold.js', async (importOriginal) => {
   return { ...real, ensureOwnerOperatingRulesSection: vi.fn() }
 })
 
+vi.mock('../web/self-healing-recovery-gate.js', () => ({
+  claimMainRecovery: vi.fn(() => 'timing-fixture-attempt'), failMainRecovery: vi.fn(), watchMainRecovery: vi.fn(),
+}))
+
 import {
   decideMainRespawnHold,
   beginMainRespawn,
@@ -224,6 +228,6 @@ describe('wiring: every in-process respawn of the main session is marked', () =>
         .filter((i) => i >= 0),
     )
     expect(beginAt).toBeLessThan(firstWork)
-    expect(fn.trimEnd()).toMatch(/\} finally \{\n\s+endRespawn\(\)\n\s+\}\n\}$/)
+    expect(fn.trimEnd()).toMatch(/\} finally \{[\s\S]*\n    endRespawn\(\)\n  \}\n\}$/)
   })
 })

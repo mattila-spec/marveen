@@ -211,6 +211,11 @@ alert_owner() {
 
 # --- live guard ----------------------------------------------------------------
 run_guard() {
+  # Codex is an RPC host, not a Claude TUI: never send Escape or /mcp to it.
+  if [ "${MARVEEN_AGENT_BACKEND:-}" = codex ] || grep -q '^MARVEEN_AGENT_BACKEND=codex$' "$INSTALL_DIR/.env" 2>/dev/null; then
+    log "Codex backend: Claude modal recovery is not applicable"
+    return 0
+  fi
   local TMUX_BIN CLAUDE MAIN_AGENT_ID SESSION pane state firstseen now action
 
   # NB: use TMUX_BIN, not TMUX -- the latter is tmux's own env var (socket,pid,
@@ -289,19 +294,23 @@ run_guard() {
       log "STUCK modal confirmed ($(( now - firstseen ))s) -> Escape (max ${MAX_ESCAPES}x)" ;;
   esac
 
+  . "$INSTALL_DIR/scripts/lib/self-healing-launch.sh" || return 73
+  self_healing_claim stuck-modal-guard || { log "STOP: shared recovery gate denied attempt"; return 0; }
+  trap 'self_healing_abort "stuck-modal recovery did not restore health"' EXIT
+
   # --- recovery: Escape (bounded), like ensure_modal_closed --------------------
   local i p
   for i in $(seq 1 "$MAX_ESCAPES"); do
     p="$("$TMUX_BIN" capture-pane -t "=$SESSION:" -p 2>/dev/null || true)"
     case "$(printf '%s' "$p" | classify_pane)" in
-      idle|busy) log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
+      idle|busy) self_healing_resolve "Escape restored an idle or busy pane"; log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
     esac
     "$TMUX_BIN" send-keys -t "=$SESSION:" Escape 2>/dev/null || true
     sleep 0.5
   done
   p="$("$TMUX_BIN" capture-pane -t "=$SESSION:" -p 2>/dev/null || true)"
   case "$(printf '%s' "$p" | classify_pane)" in
-    idle|busy) log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
+    idle|busy) self_healing_resolve "Escape restored an idle or busy pane"; log "modal closed via Escape -- session healthy"; rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true; return 0 ;;
   esac
 
   # --- still stuck: respawn-pane (cross-watchdog coordination via grace stamp) --
@@ -420,6 +429,7 @@ run_guard() {
     date +%s > "$RESPAWN_STAMP" 2>/dev/null || true
     echo $(( count + 1 )) > "$RESPAWN_COUNT_FILE" 2>/dev/null || true
     rm -f "$FIRSTSEEN_STAMP" 2>/dev/null || true
+    self_healing_watch "$SESSION"
     log "respawn-pane issued"
     alert_owner "⚠️ The ${SESSION} session was stuck behind an open dialog -- auto-respawn #$((count+1)) issued. If you messaged during the outage and got no reply, please resend."
   else

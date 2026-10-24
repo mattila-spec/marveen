@@ -21,8 +21,11 @@ WorkingDirectory=/path/to/marveen
 # Rebuild the better-sqlite3 native binding if it can't load for the current Node
 # ABI before starting. Prevents the "Could not locate the bindings file"
 # crash-loop after an npm install / Node upgrade (root-caused 2026-07-03).
+ExecStartPre=/usr/bin/python3 /path/to/marveen/scripts/self-healing-attempt-gate.py claim main-channels systemd-supervisor
 ExecStartPre=/path/to/marveen/scripts/ensure-native-modules.sh
 ExecStart=/path/to/marveen/scripts/channels.sh
+ExecStartPost=/usr/bin/python3 /path/to/marveen/scripts/self-healing-attempt-gate.py watch-active main-channels systemd-supervisor
+ExecStopPost=/usr/bin/python3 /path/to/marveen/scripts/self-healing-attempt-gate.py fail-active main-channels systemd-supervisor service-exited-before-health-verification
 # P1 FIX: always (not on-failure). channels.sh exits 0 when the tmux session
 # dies normally, which on-failure did NOT restart -> the bridge was dead for
 # ~28 min (08:29-08:57). The StartLimit above + channels.sh's own rapid-fail
@@ -34,6 +37,7 @@ StandardError=append:/path/to/marveen/store/channels.error.log
 Environment=PATH=/home/USER/.local/bin:/home/USER/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/home/USER
 Environment=USER=youruser
+Environment=MARVEEN_SELF_HEALING_GATE_MANAGED=systemd-supervisor
 Environment=TERM=xterm-256color
 Environment=LANG=en_US.UTF-8
 Environment=TZ=Europe/Budapest

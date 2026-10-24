@@ -247,6 +247,7 @@ try {
   if (process.argv.includes('--offline-import-smoke')) {
     console.log('OFFLINE_IMPORT_OK')
   } else if (preflight) {
+    readCanonicalOwnerRules(root)
     const rpc = await openCodex()
     await closeCodex(rpc)
     console.log('ChatGPT authentication OK; channel not started')

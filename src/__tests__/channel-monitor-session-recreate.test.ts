@@ -73,7 +73,7 @@ describe("channel-monitor: self-healing vanished main session", () => {
     // absent, and the main channel stayed down).
     const fn = sliceFn("respawnMarveenSessionFresh")
     expect(fn).toContain("can't find pane")
-    expect(fn).toContain("createMainChannelsSession()")
+    expect(fn).toContain("createMainChannelsSession(attempt || inheritedAttempt)")
   })
 
   it("resumeMarveenSession writes the shared respawn stamp (2026-06-08 self-defer fix)", () => {

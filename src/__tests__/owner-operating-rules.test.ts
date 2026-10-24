@@ -191,8 +191,11 @@ describe('dashboard Claude resume gate', () => {
     }).outputText
     const replacePane = vi.fn()
     const endRespawn = vi.fn()
+    const logError = vi.fn()
     const resume = runInNewContext(javascript, {
       getProvider: () => ({ type: 'telegram', pluginId: 'fixture' }), getMainAgentProvider: () => 'telegram',
+      process: { env: { MARVEEN_AGENT_BACKEND: 'sdk' } },
+      claimMainRecovery: () => 'owner-fixture-attempt', watchMainRecovery: vi.fn(), failMainRecovery: vi.fn(),
       beginMainRespawn: () => endRespawn, reapChannelOrphans: vi.fn(), reapDetachedChannelClaudes: vi.fn(),
       tmuxBin: () => 'fixture-tmux', PROJECT_ROOT: f.root, MAIN_AGENT_ID,
       ensureSharedClaudeOnboarded: vi.fn(), claudeBin: () => 'fixture-claude',
@@ -200,10 +203,11 @@ describe('dashboard Claude resume gate', () => {
       writeMainExtraPluginsSettings: vi.fn(), mainChannelStateEnv: vi.fn(), readConfiguredMainModel: vi.fn(),
       resolveMainConfigDecision: vi.fn(), execFileSync: replacePane,
       ensureOwnerOperatingRulesSection: (name: string) => ensureOwnerOperatingRulesSection(name, f.paths),
-      logger: { warn: vi.fn(), error: vi.fn() },
+      logger: { warn: vi.fn(), error: logError },
     }) as () => Promise<boolean>
     expect(await resume()).toBe(false)
     expect(replacePane).not.toHaveBeenCalled()
+    expect(String(logError.mock.calls[0][0].err)).toContain('Required owner rules')
     expect(endRespawn).toHaveBeenCalledOnce()
   })
 })

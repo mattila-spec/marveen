@@ -48,16 +48,17 @@ describe("respawnMainSessionFresh: the session may be gone after the reap", () =
   it("relaunches through channels.sh (the guard's path), not a bespoke tmux command", () => {
     // 45b778e9: the relaunch branch lives in relaunchGoneMainSession, with createMainChannelsSession
     // and writeRespawnStamp passed in; its behaviour is tested below.
-    expect(body).toMatch(/relaunchGoneMainSession\(createMainChannelsSession, writeRespawnStamp\)/)
+    expect(body).toMatch(/relaunchGoneMainSession\(\(\) => createMainChannelsSession\(attempt \|\| undefined\), writeRespawnStamp\)/)
     // A hand-rolled `tmux new-session` here is the drift this comment warns about: it would
     // miss the first-run dialog handling, the /rename and the plugin bring-up.
     expect(body).not.toMatch(/'new-session'/)
   })
 
   it("the relaunch branch returns right after the helper: no respawn-pane follow-ups on that path", () => {
-    const callAt = body.indexOf("relaunchGoneMainSession(createMainChannelsSession, writeRespawnStamp)")
+    const callAt = body.indexOf("relaunchGoneMainSession(() => createMainChannelsSession(attempt || undefined), writeRespawnStamp)")
     expect(callAt, "relaunch call not found").toBeGreaterThan(0)
-    expect(body.slice(callAt).split("\n")[1]).toMatch(/^\s*return\s*$/)
+    expect(body.slice(callAt).split("\n")[1]).toMatch(/^\s*recoveryStarted = true\s*$/)
+    expect(body.slice(callAt).split("\n")[2]).toMatch(/^\s*return\s*$/)
   })
 })
 

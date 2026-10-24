@@ -523,6 +523,7 @@ fi
 # at a fixture file instead of a live store/.
 CHANNELS_EXITS_LOG="${CHANNELS_EXITS_LOG:-$INSTALL_DIR/store/channels-exits.log}"
 record_channels_exit() {
+  if declare -F self_healing_abort >/dev/null; then self_healing_abort "channels launcher exited before verified recovery"; fi
   _rc="$1"
   # LAUNCHGATE1008: a gate refusal from a checkout that is not an install (no store/)
   # has already said why on stderr; the exit row would only add two failure lines.
@@ -601,6 +602,8 @@ if [ ! -f "$INSTALL_DIR/.env" ]; then
   exit 3
 fi
 # LAUNCHGATE1008-END: everything below launches.
+. "$INSTALL_DIR/scripts/lib/self-healing-launch.sh" || exit 73
+self_healing_claim channels-launcher || exit 73
 
 # Self-healing guard: ensure PLUGIN_ID is enabled in the PROJECT settings.json
 # before launch. A PR review-reset or branch-switch that reverts
@@ -1294,6 +1297,7 @@ if command -v node >/dev/null 2>&1; then
 fi
 
 # Régi session takarítás
+node "$INSTALL_DIR/scripts/sync-owner-rules.mjs" || exit 1
 $TMUX kill-session -t "=$SESSION:" 2>/dev/null
 
 # Reap orphan main-agent channel pollers (bun/node grandchildren of the
@@ -1640,6 +1644,7 @@ _tmux_set_auth_globals
 # remain-on-exit on, the pane survives as "dead" and the relaunch can always
 # find and reuse it. (Also fixed at the reap itself, see channel-poller-reap.ts;
 # this is the defense-in-depth layer, not the only fix.)
+self_healing_watch "$SESSION"
 $TMUX set-option -t "=$SESSION:" remain-on-exit on 2>/dev/null || true
 $TMUX set-environment -g -u "$STATE_ENV_VAR" 2>/dev/null || true
 

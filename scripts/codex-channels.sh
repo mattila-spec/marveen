@@ -9,11 +9,15 @@ export MARVEEN_CODEX_TELEGRAM_PLUGIN="${MARVEEN_CODEX_TELEGRAM_PLUGIN:-$HOME/.cl
 if [ "${1:-}" = "--pane" ]; then
   exec node scripts/codex-channels.mjs
 fi
+. "$INSTALL_DIR/scripts/lib/self-healing-launch.sh" || exit 73
+self_healing_claim codex-launcher || exit 73
+trap 'self_healing_abort "Codex launcher exited before verified recovery"' EXIT
 # Validate login before taking over the old tmux session.
 node scripts/codex-channels.mjs --preflight
 tmux kill-session -t "=$SESSION:" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
   "env MARVEEN_CODEX_TELEGRAM_PLUGIN='$MARVEEN_CODEX_TELEGRAM_PLUGIN' /bin/bash '$INSTALL_DIR/scripts/codex-channels.sh' --pane"
+self_healing_watch "$SESSION"
 trap 'tmux kill-session -t "=$SESSION:" 2>/dev/null || true; exit 0' TERM INT
 while tmux has-session -t "=$SESSION:" 2>/dev/null; do sleep 5; done
 exit 1
