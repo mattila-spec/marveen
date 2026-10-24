@@ -11,7 +11,9 @@ incident and an atomic, private state file. Two failed attempts stop further
 automatic recovery. Verified stable session health resets that incident; a
 manual restart does not silently reset its counters. Invalid persisted state
 fails closed. Health checks use an exact tmux session target and a fresh
-keepalive newer than the current attempt.
+keepalive newer than the current attempt for Claude. Codex instead requires
+a status snapshot from the current launch, a live PID and its responding local
+Unix socket; idle status does not need periodic rewrites.
 
 Dashboard automatic hard restarts, scheduled fresh starts, resume/fresh recovery,
 MCP reconnect, inbound recovery, context/usage fallback and reauthentication

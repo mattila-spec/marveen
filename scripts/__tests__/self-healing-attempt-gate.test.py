@@ -2,6 +2,9 @@
 """Regression tests for the cross-process, per-incident recovery gate."""
 
 import concurrent.futures
+import importlib.util
+import socket
+import time
 import json
 import os
 from pathlib import Path
@@ -106,6 +109,35 @@ def main():
         assert verified.returncode == 0 and result(verified)["result"] == "resolved"
         assert json.loads(capture.read_text()) == ["has-session", "-t", "=fixture-channels:"]
         print("PASS: exact tmux session and fresh keepalive verify recovery")
+
+        # Codex has no Claude keepalive: exercise a real local Unix listener,
+        # current test PID, fresh status and the actual watcher subprocess.
+        install = Path(tmp) / "codex-install"
+        codex_store = install / "store" / "codex"
+        codex_store.mkdir(parents=True)
+        codex_state = Path(tmp) / "codex-attempt.json"
+        claim = result(invoke(codex_state, "claim", "main-channels", "codex-watch"))
+        status_path = codex_store / "status.json"
+        status_path.write_text(json.dumps({"pid": os.getpid(), "busy": False}))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(codex_store / "channel.sock"))
+            listener.listen(8)
+            verified = invoke(codex_state, "watch", "main-channels", claim["attempt_id"], "fixture-channels",
+                TMUX_BIN=str(fake_tmux), TMUX_CAPTURE=str(capture), MARVEEN_INSTALL_DIR=str(install),
+                MARVEEN_AGENT_BACKEND="codex", MARVEEN_SELF_HEALING_WATCH_SECONDS="2",
+                MARVEEN_SELF_HEALING_STABLE_SECONDS="0", MARVEEN_SELF_HEALING_POLL_SECONDS="0.01")
+            assert verified.returncode == 0 and result(verified)["result"] == "resolved"
+            spec = importlib.util.spec_from_file_location("gate_fixture", GATE)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            assert module.codex_health(install, time.time() - 2)
+            assert not module.codex_health(install, time.time() + 1), "old snapshot must not prove a new launch"
+            status_path.write_text(json.dumps({"pid": 0, "busy": False}))
+            assert not module.codex_health(install, 0), "invalid PID must fail closed"
+            status_path.write_text(json.dumps({"pid": os.getpid(), "busy": False}))
+        assert not module.codex_health(install, 0), "stale socket must not prove a healthy process"
+        assert not (install / "store" / ".channel-keepalive").exists()
+        print("PASS: Codex recovery verifies live PID and local socket without a Claude heartbeat; stale evidence fails closed")
 
 
 

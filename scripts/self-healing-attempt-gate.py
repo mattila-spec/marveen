@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -205,6 +206,36 @@ def manual_reset(key, evidence):
     return with_state(action)
 
 
+def uses_codex(install):
+    configured = os.environ.get("MARVEEN_AGENT_BACKEND")
+    if configured:
+        return configured == "codex"
+    try:
+        return any(line.strip() == "MARVEEN_AGENT_BACKEND=codex"
+                   for line in (install / ".env").read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return False
+
+
+def codex_health(install, attempt_started):
+    # Idle status deliberately has no periodic rewrites. Require this launch's
+    # snapshot, a live PID and a responding local socket, not a Claude heartbeat.
+    status_path = install / "store" / "codex" / "status.json"
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        if not isinstance(status, dict) or type(status.get("pid")) is not int or status["pid"] <= 1 or type(status.get("busy")) is not bool:
+            return False
+        if status_path.stat().st_mtime < attempt_started:
+            return False
+        os.kill(status["pid"], 0)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(install / "store" / "codex" / "channel.sock"))
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def watch_health(key, token, session):
     key = incident_key(key)
     timeout = int(os.environ.get("MARVEEN_SELF_HEALING_WATCH_SECONDS", "300"))
@@ -216,6 +247,7 @@ def watch_health(key, token, session):
     if not active or active.get("id") != token:
         return {"ok": True, "reason": "attempt already completed or superseded", "incident": key}
     attempt_started = float(active.get("started_at", time.time()))
+    codex = uses_codex(install)
     stable_since = None
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -232,12 +264,13 @@ def watch_health(key, token, session):
             keepalive_ok = keepalive_mtime >= attempt_started and time.time() - keepalive_mtime <= 300
         except OSError:
             keepalive_ok = False
-        if pane_ok and keepalive_ok:
+        channel_ok = codex_health(install, attempt_started) if codex else keepalive_ok
+        if pane_ok and channel_ok:
             if stable_since is None:
                 stable_since = time.monotonic()
             if time.monotonic() - stable_since >= stable_needed:
                 return finish(key, token, success=True,
-                              evidence=f"tmux session {session} present and channel keepalive fresh for {stable_needed}s")
+                              evidence=f"tmux session {session} present and {'Codex PID/socket healthy' if codex else 'channel keepalive fresh'} for {stable_needed}s")
         else:
             stable_since = None
         time.sleep(poll)
