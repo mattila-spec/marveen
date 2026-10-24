@@ -214,7 +214,7 @@ check "7 a systemd-ag setsid-del inditja a finalizert" \
 # masodik osszehuzta a sorokat, es akkor a `||` fallback EGY sorba kerult az elsodlegessel,
 # tehat egy kivett redirect MEGSEM latszott (zold mutans). A darabszam-egyezes mindkettot
 # elkapja: ha barmelyik indito elveszti a naplózast, a ket szam eltavolodik.
-indit="$(grep -c 'bash "\$FINALIZE_SCRIPT" "\${FINALIZE_ARGS\[@\]}"' <<<"$U")"
+indit="$(grep -c '"\$FINALIZE_SCRIPT" "\${FINALIZE_ARGS\[@\]}"' <<<"$U")"
 naploz="$(grep -c '>> "\$FINALIZE_LOG" 2>&1' <<<"$U")"
 check "7 MINDEN finalizer-indito a naplóba ir (indito: $indit, redirect: $naploz)" \
   "$([ "$indit" -gt 0 ] && [ "$indit" = "$naploz" ] && echo 0 || echo 1)"
